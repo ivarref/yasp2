@@ -10,7 +10,7 @@
   {:added "1.1"}
   (:require [clojure.java.io :as io :refer [input-stream]]
             [clojure.string :as str])
-  (:import (java.io ByteArrayInputStream)
+  (:import (java.io ByteArrayInputStream Closeable)
            (java.net InetSocketAddress)
            (java.security KeyFactory
                           KeyStore
@@ -252,7 +252,7 @@
                 nil
                 nil))))))
 
-(defn- close-silently [^SSLSocket sock]
+(defn close-silently [^Closeable sock]
   (when sock
     (try
       (.close sock)

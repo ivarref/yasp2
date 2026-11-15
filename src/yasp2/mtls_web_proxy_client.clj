@@ -1,14 +1,13 @@
 (ns yasp2.mtls-web-proxy-client
-  (:require [clojure.edn :as edn]
-            [clojure.java.io :as io]
+  (:require [clojure.java.io :as io]
             [nrepl.http :as http]
             [nrepl.tls :as tls]
-            [yasp2.web-echo-server :as web-echo-server])
+            [yasp2.web-server :as web-server])
   (:import (java.io BufferedInputStream BufferedOutputStream BufferedReader InputStream InputStreamReader OutputStream)
            (java.lang AutoCloseable)
-           (java.net InetAddress InetSocketAddress ServerSocket Socket SocketTimeoutException)
+           (java.net InetSocketAddress ServerSocket Socket SocketTimeoutException)
            (java.nio.charset StandardCharsets)
-           (java.util Arrays Base64)
+           (java.util Arrays)
            (javax.net.ssl SSLServerSocket SSLSocket)))
 
 (set! *warn-on-reflection* true)
@@ -45,6 +44,7 @@
 
 (def buf-size 65536)
 
+
 (defn- do-copy [^InputStream input ^OutputStream output]
   (let [buffer (make-array Byte/TYPE buf-size)]
     (loop []
@@ -62,9 +62,6 @@
     (do-copy in out)))
 
 
-#_(def tls-echo-port (promise))
-
-
 (defn start-tls-echo-server! [server-keys-file]
   (let [server-ctx (tls/ssl-str-context (slurp server-keys-file))]
     (let [^SSLServerSocket server (tls/server-socket server-ctx "127.0.0.1" 0)]
@@ -77,159 +74,173 @@
       server)))
 
 
+(defn send-to-remote!
+  ([web-server-endpoint header]
+   (http/post web-server-endpoint header))
+  ([web-server-endpoint header buffer siz]
+   (println ">>>> Client send" header (alength ^byte/1 buffer))
+   (let [buf' (^[byte/1 int] Arrays/copyOf buffer (int siz))]
+     (http/post web-server-endpoint header buf'))))
 
 
-(defn- pr-str-safe [x]
-  (let [v (binding [*print-dup* false
-                    *print-meta* false
-                    *print-readably* true
-                    *print-length* nil
-                    *print-level* nil
-                    *print-namespace-maps* false]
-            (pr-str x))]
-    (if (= x (edn/read-string v))
-      v
-      (throw (ex-info (str "Could not pr-str object") {:input x})))))
+(defn read-some [^BufferedInputStream in ^byte/1 buf]
+  (try
+    (.read in buf)
+    (catch SocketTimeoutException _ste
+      0)))
 
 
-(defn bytes->b64-str [^bytes b]
-  (.encodeToString (Base64/getMimeEncoder 64 (.getBytes "\n" StandardCharsets/US_ASCII)) b))
+(defn- tls-handshake-pump [^String web-server-endpoint
+                           ^String session-id
+                           tls-sock-future
+                           ^Socket tcp-echo-sock
+                           ^BufferedInputStream tcp-echo-read
+                           ^BufferedOutputStream tcp-echo-write]
+  (.setSoTimeout tcp-echo-sock 1000)
+  (let [start-time (System/currentTimeMillis)
+        buffer (make-array Byte/TYPE buf-size)]
+    (loop [n 0
+           remote-available? false]
+      (println "Handshake pump" n)
+      (let [spent-ms (- (System/currentTimeMillis)
+                        start-time)]
+        (cond
+          (> spent-ms 60000)
+          (do
+            (println "Spent too long time to establish mTLS connection")
+            {:error :handshake-timeout})
+
+          (realized? tls-sock-future)
+          @tls-sock-future
+
+          :else
+          (let [size (if (and remote-available? (= 0 (.available tcp-echo-read)))
+                       ; don't do a blocking read if the remote has more data coming
+                       0
+                       (read-some tcp-echo-read buffer))]
+            (if (= -1 size)
+              (do
+                (println "EOF reached when reading from tcp-echo")
+                {:error :eof-tcp-echo})
+              (let [available (.available tcp-echo-read)
+                    header {:session   session-id
+                            :data      true
+                            :available available}]
+                (let [[hdr chunk] (send-to-remote! web-server-endpoint header buffer size)]
+                  (println "<<<< Client recv" hdr (alength ^byte/1 chunk))
+                  (io/copy chunk tcp-echo-write)
+                  (.flush tcp-echo-write)
+                  (if (:eof hdr)
+                    {:error :eof-remote-handshake}
+                    (recur (inc n) (:available hdr))))))))))))
 
 
-(defn- part-str->bytes [part-str]
-  (.decode (Base64/getMimeDecoder) (.getBytes ^String part-str StandardCharsets/US_ASCII)))
+(defn tls-pump [^String web-server-endpoint
+                ^String session-id
+                ^Socket plaintext
+                ^Socket tcp-echo-sock
+                ^BufferedInputStream tcp-echo-read
+                ^BufferedOutputStream tcp-echo-write
+                ^Socket tls-client]
+  (let [buf-plaintext (make-array Byte/TYPE buf-size)
+        buf-tls (make-array Byte/TYPE (* 4 buf-size))]
+    (with-open [plaintext-in (BufferedInputStream. (.getInputStream plaintext))
+                plaintext-out (BufferedOutputStream. (.getOutputStream plaintext))
+                tls-client-in (BufferedInputStream. (.getInputStream tls-client))
+                tls-client-out (BufferedOutputStream. (.getOutputStream tls-client))]
+      (.setSoTimeout plaintext 1000)
+      (.setSoTimeout tls-client 10)
+      (.setSoTimeout tcp-echo-sock 10)
+      (loop []
+        ;; Read from the plaintext connection ...
+        (let [n (read-some plaintext-in buf-plaintext)]
+          ;; Is it an EOF?
+          (if (= -1 n)
+            (do
+              (println "Client proxy: EOF reached")
+              (send-to-remote! web-server-endpoint {:session session-id :eof true})
 
-(defn- part-str->edn [part-str]
-  (let [bytes (.decode (Base64/getMimeDecoder) (.getBytes ^String part-str StandardCharsets/US_ASCII))
-        str' (String. bytes StandardCharsets/US_ASCII)]
-    (edn/read-string str')))
+              {:eof :client})
+            (do
+              ;; Forward bytes to the TLS client
+              (when (pos-int? n)
+                (.write tls-client-out buf-plaintext 0 n)
+                (.flush tls-client-out))
 
+              ;; Read bytes back as "TLS bytes"
+              (let [n2 (read-some tcp-echo-read buf-tls)]
 
-(defn send-to-remote! [web-server-endpoint header buffer]
-  (println ">>>> Client send" header (alength ^byte/1 buffer))
-  (http/post web-server-endpoint header buffer))
+                ;; Forward the TLS bytes to the remote web server
+                (let [[hdr chunk] (send-to-remote! web-server-endpoint
+                                                   {:session session-id
+                                                    :data    true}
+                                                   buf-tls
+                                                   n2)]
+                  (cond
+                    (:eof hdr)
+                    {:eof :remote}
+
+                    (:data hdr)
+                    (do
+                      ;; Write the TLS bytes back to the TCP echo server ...
+                      (.write tcp-echo-write ^byte/1 chunk)
+                      (.flush tcp-echo-write)
+
+                      ;; Read decrypted TLS back
+                      (let [n3 (read-some tls-client-in buf-plaintext)]
+                        ;; Write the decrypted bytes to the plaintext connection
+                        (.write plaintext-out buf-plaintext 0 (int n3))
+                        (.flush plaintext-out)
+                        (recur)))))))))))))
 
 
 (defn run-proxy! [tls-context web-server-endpoint ^Socket plaintext']
   ;; plaintext connection established
-  (let [interim-echo-server (ServerSocket.)]
-    (.bind interim-echo-server (InetSocketAddress. "127.0.0.1" 0))
-    (let [echo-port (.getLocalPort interim-echo-server)
-          _ (println "interim echo server listening on port" echo-port)
-          tls-client (future
-                       (try
-                         (let [^SSLSocket sock (tls/socket tls-context "127.0.0.1" echo-port 10000)]
-                           sock)
-                         (catch Exception e
-                           (println "Could not create tls-client:" (ex-message e))
-                           e)))
-          tcp-echo-sock (.accept interim-echo-server)
-          _ (.close interim-echo-server)
-          _ (println "interim echo server accepted socket")
-          _ (.setSoTimeout tcp-echo-sock 1000)
-          tcp-echo-read (BufferedInputStream. (.getInputStream tcp-echo-sock))
-          tcp-echo-write (BufferedOutputStream. (.getOutputStream tcp-echo-sock))
-          start-time (System/currentTimeMillis)
-          session-id (str (random-uuid))
-          ;; Establish mTLS connection. The TLS client will send some bytes to the echo server.
-          ;; We send those bytes to the remote and keep the pump going until the tls-client is returned
-          tls-client' (loop [n 0
-                             remote-available? false]
-                        (println "initial TLS pump" n)
-                        (let [spent-ms (- (System/currentTimeMillis)
-                                          start-time)]
-                          (when (> spent-ms 60000)
-                            (println "Spent too long time to establish mTLS connection")
-                            (throw (ex-info "Could not establish mTLS connection (timeout)" {}))))
-                        (if (realized? tls-client)
-                          (let [tls-client' @tls-client]
-                            (if (instance? Exception tls-client')
-                              (do
-                                (println "Could not create tls-client")
-                                nil)
-                              (do
-                                (println "Returning tls client")
-                                tls-client')))
-                          (let [buffer (make-array Byte/TYPE buf-size)]
-                            (let [size (if (and remote-available? (= 0 (.available tcp-echo-read)))
-                                         0                  ; don't do a blocking read if the remote has more data coming
-                                         (try
-                                           #_(println "Reading from TCP echo server")
-                                           (.read tcp-echo-read buffer)
-                                           (catch SocketTimeoutException _ste
-                                             0)))]
-                              (if (= -1 size)
-                                (do
-                                  (println "EOF reached when reading from tcp-echo")
-                                  nil)
-                                (do
-                                  #_(println "Read" size "bytes from tcp-echo")
-                                  (let [available (.available tcp-echo-read)
-                                        header {:session   session-id
-                                                :available (pos? available)}]
-                                    #_(println "tcp-echo available:" available)
-                                    (let [[hdr chunk] (send-to-remote! web-server-endpoint header
-                                                                       (^[byte/1 int] Arrays/copyOf buffer (int size)))]
-                                      (println "<<<< Client recv" hdr (alength ^byte/1 chunk))
-                                      (io/copy chunk tcp-echo-write)
-                                      (.flush tcp-echo-write)
-                                      (if (:eof hdr)
-                                        nil
-                                        (recur (inc n) (:available hdr)))))))))))]
-      (when tls-client'
-        (assert (instance? Socket tls-client'))
-        (let [buf-plaintext (make-array Byte/TYPE buf-size)
-              buf-tls (make-array Byte/TYPE (* 4 buf-size))]
-          (with-open [sock plaintext'
-                      plaintext-in (BufferedInputStream. (.getInputStream sock))
-                      plaintext-out (BufferedOutputStream. (.getOutputStream sock))
-                      tls-client-in (BufferedInputStream. (.getInputStream ^Socket tls-client'))
-                      tls-client-out (BufferedOutputStream. (.getOutputStream ^Socket tls-client'))]
-            (.setSoTimeout sock 1000)
-            (.setSoTimeout ^Socket tls-client' 10)
-            (.setSoTimeout tcp-echo-sock 10)
-            (loop []
-              ;; Read from the plaintext connection ...
-              (let [n (try
-                        (.read plaintext-in buf-plaintext)
-                        (catch SocketTimeoutException _ste
-                          0))]
-                ;; Forward those bytes to the TLS client
-                (when (pos-int? n)
-                  (.write tls-client-out buf-plaintext 0 n)
-                  (.flush tls-client-out))
+  (try
+    (let [interim-echo-server (ServerSocket.)
+          _ (.bind interim-echo-server (InetSocketAddress. "127.0.0.1" 0))
+          echo-port (.getLocalPort interim-echo-server)]
+      (let [tls-client (future
+                         (try
+                           (let [sock (tls/socket tls-context "127.0.0.1" echo-port 60000)]
+                             {:sock sock})
+                           (catch Exception e
+                             (println "Could not create tls-client:" (ex-message e))
+                             {:error e})))]
+        (with-open [tcp-echo-sock (.accept interim-echo-server)
+                    tcp-echo-read (BufferedInputStream. (.getInputStream tcp-echo-sock))
+                    tcp-echo-write (BufferedOutputStream. (.getOutputStream tcp-echo-sock))]
+          (tls/close-silently interim-echo-server)
+          (let [session-id (str (random-uuid))
+                ;; Establish mTLS connection.
+                ;; The TLS client will send some bytes to the echo server.
+                ;; We send those bytes to the remote and keep the pump going
+                ;; until the tls-client is returned
+                tls-client1 (tls-handshake-pump
+                              web-server-endpoint
+                              session-id
+                              tls-client
+                              tcp-echo-sock
+                              tcp-echo-read
+                              tcp-echo-write)]
+            (cond
+              (:error tls-client1)
+              tls-client1
 
-                ;; Read those bytes back as "TLS bytes"
-                (let [n2 (try
-                           (.read tcp-echo-read buf-tls)
-                           (catch SocketTimeoutException _ste
-                             0))]
+              (:sock tls-client1)
+              (with-open [^Socket tls-client' (:sock tls-client1)]
+                (tls-pump web-server-endpoint
+                          session-id
+                          plaintext'
+                          tcp-echo-sock
+                          tcp-echo-read
+                          tcp-echo-write
+                          tls-client'))
+              :else
+              (throw (ex-info "Unexpected state" {:tls-client tls-client1})))))))
+    (finally
+      (tls/close-silently plaintext'))))
 
-                  ;; Forward the TLS bytes to the remote web server
-                  (let [[hdr chunk] (send-to-remote! web-server-endpoint
-                                                     {:session session-id}
-                                                     (^[byte/1 int] Arrays/copyOf buf-tls (int n2)))]
-                    ;; Write the TLS bytes back to the TCP echo server ...
-                    (.write tcp-echo-write ^byte/1 chunk)
-                    (.flush tcp-echo-write)
-
-                    ;; Read decrypted TLS back
-                    (let [n3 (try
-                               (.read tls-client-in buf-plaintext)
-                               (catch SocketTimeoutException _ste
-                                 0))]
-
-                      ;; Write the decrypted bytes to the plaintext connection
-                      (.write plaintext-out buf-plaintext 0 (int n3))
-                      (.flush plaintext-out)
-                      (recur))))))))))
-    nil))
-
-#_(defn dev [_]
-    (let [v (make-array Byte/TYPE 123)
-          cpy (^[byte/1 int] Arrays/copyOf v (int 0))])
-    (send-to-remote! {} {}
-                     (make-array Byte/TYPE 0)))
 
 (defn start-plaintext-echo-server! [client-keys-file web-server-endpoint]
   (let [tls-context (tls/ssl-str-context (slurp client-keys-file))
@@ -247,55 +258,38 @@
         (recur)))
     server))
 
-#_(defn run [{:keys [remote-url]}]
-    (let [[headers payload-bytes] (http/post remote-url {:hello :what})]
-      (when-not (= (get headers :hello) :world)
-        (throw (ex-info "Bad HTTP response for :hello message. Is web proxy running?" {:remote-url remote-url})))
-      (println "OK :hello-message"))
-
-    #_(let [opts' {:client-tls-context (tls/ssl-str-context (slurp "client.keys"))}
-            plaintext-port 9999
-            ss (ServerSocket. plaintext-port
-                              0
-                              (InetAddress/getLoopbackAddress))]
-        (future
-          (let [s (.accept ss)]
-            (println "plaintext server got new client")
-            (run-proxy! opts' s)))
-        (with-open [client (^[InetAddress int] Socket/new (InetAddress/getLoopbackAddress) plaintext-port)
-                    in (BufferedReader. (InputStreamReader. (.getInputStream client) StandardCharsets/US_ASCII))
-                    out (.getOutputStream client)]
-          (.write out (.getBytes "Hello\n" StandardCharsets/US_ASCII))
-          (.flush out)
-          (println "received:" (.readLine in)))))
 
 (defn dev []
   (try
-    (with-open [^ServerSocket tls-server (start-tls-echo-server! "server.keys")
-                ^AutoCloseable web-server (web-echo-server/start-web-server! (atom {}) (.getLocalPort tls-server))
-                ^ServerSocket plaintext-server (start-plaintext-echo-server!
-                                                 "client.keys"
-                                                 (str "http://127.0.0.1:"
-                                                      (-> web-server meta :port)
-                                                      "/nrepl"))]
-      (let [web-server-port (-> web-server meta :port)
-            plaintext-port (.getLocalPort plaintext-server)]
-        (println "plaintext-server ready at port" plaintext-port)
-        (println "web-server ready at port" web-server-port)
-        (println "tls-server ready at port" (.getLocalPort tls-server))
-        (with-open [^Socket client (Socket. "127.0.0.1" ^int plaintext-port)
-                    in (BufferedReader. (InputStreamReader. (.getInputStream client) StandardCharsets/US_ASCII))
-                    out (.getOutputStream client)]
-          (println "Writing 'Hello\\n'")
-          (.write out (.getBytes "Hello\n" StandardCharsets/US_ASCII))
-          (.flush out)
-          (println "Waiting for reply...")
-          (let [fut (future
-                      (println "received:" (.readLine in)))]
-            (when (= :timeout (deref fut 20000 :timeout))
-              (println "Timeout waiting for reply!"))))
-        #_(run {:remote-url (str "http://127.0.0.1:" web-server-port "/nrepl")})))
+    (let [web-server-state (atom {})]
+      (with-open [^ServerSocket tls-server (start-tls-echo-server! "server.keys")
+                  ^AutoCloseable web-server (web-server/start-web-server! web-server-state (.getLocalPort tls-server))
+                  ^ServerSocket plaintext-server (start-plaintext-echo-server!
+                                                   "client.keys"
+                                                   (str "http://127.0.0.1:"
+                                                        (-> web-server meta :port)
+                                                        "/nrepl"))]
+        (let [web-server-port (-> web-server meta :port)
+              plaintext-port (.getLocalPort plaintext-server)]
+          (println "plaintext-server ready at port" plaintext-port)
+          (println "web-server ready at port" web-server-port)
+          (println "tls-server ready at port" (.getLocalPort tls-server))
+          (with-open [^Socket client (Socket. "127.0.0.1" ^int plaintext-port)
+                      in (BufferedReader. (InputStreamReader. (.getInputStream client) StandardCharsets/US_ASCII))
+                      out (.getOutputStream client)]
+            (println "Writing 'Hello\\n'")
+            (.write out (.getBytes "Hello\n" StandardCharsets/US_ASCII))
+            (.flush out)
+            (println "Waiting for reply...")
+            (let [fut (future
+                        (println "received:" (.readLine in)))]
+              (when (= :timeout (deref fut 10000 :timeout))
+                (println "Timeout waiting for reply!"))))
+          (let [web-server-shutdown (future
+                                      (while (not (empty? (keys (get @web-server-state :session))))
+                                        (Thread/sleep 10)))]
+            (when (= :timeout (deref web-server-shutdown 10000 :timeout))
+              (println "Timeout waiting for web server to shutdown")))
+          #_(run {:remote-url (str "http://127.0.0.1:" web-server-port "/nrepl")}))))
     (catch Exception e
-      (println "Error:" (ex-message e))))
-  #_(let [web-server-port (web-echo-server/start-web-server! {})]
-      (println "web-server port is:" web-server-port)))
+      (println "Error:" (ex-message e)))))
