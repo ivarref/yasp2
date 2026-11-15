@@ -1,0 +1,204 @@
+(ns certgen
+  "Generates a root CA, plus a server and a client certificate signed by that CA.
+  Uses elliptic curve keys (P-256) and ECDSA with SHA-256.
+
+  No dependencies beyond the JVM: the X.509 certificates are DER encoded by hand,
+  since the JDK has no public API for creating certificates.
+
+  Usage: clojure -Sdeps '{:paths [\"src\"]}' -M -m certgen"
+  (:require [clojure.java.io :as io])
+  (:import (java.io ByteArrayInputStream ByteArrayOutputStream FileOutputStream)
+           (java.math BigInteger)
+           (java.net InetAddress)
+           (java.nio.charset StandardCharsets)
+           (java.security KeyPair KeyPairGenerator MessageDigest PrivateKey SecureRandom Signature)
+           (java.security.cert CertificateFactory X509Certificate)
+           (java.security.spec ECGenParameterSpec)
+           (java.time ZoneOffset ZonedDateTime)
+           (java.time.format DateTimeFormatter)
+           (java.util Arrays Base64 UUID)))
+
+(set! *warn-on-reflection* true)
+
+;; Minimal DER encoder
+
+(defn- der-length ^bytes [^long n]
+  (if (< n 128)
+    (byte-array [n])
+    (let [len-bytes (loop [n n acc ()]
+                      (if (zero? n) acc (recur (bit-shift-right n 8) (conj acc (bit-and n 0xff)))))]
+      (byte-array (map unchecked-byte (cons (bit-or 0x80 (count len-bytes)) len-bytes))))))
+
+(defn- concat-bytes ^bytes [byte-arrays]
+  (let [out (ByteArrayOutputStream.)]
+    (doseq [^bytes b byte-arrays]
+      (.write out b 0 (alength b)))
+    (.toByteArray out)))
+
+(defn- tlv ^bytes [tag & contents]
+  (let [content (concat-bytes contents)]
+    (concat-bytes [(byte-array [(unchecked-byte tag)])
+                   (der-length (alength content))
+                   content])))
+
+(defn- der-seq ^bytes [& items] (apply tlv 0x30 items))
+(defn- der-set ^bytes [& items] (apply tlv 0x31 items))
+(defn- der-int ^bytes [^BigInteger n] (tlv 0x02 (.toByteArray n)))
+(defn- der-bool ^bytes [b] (tlv 0x01 (byte-array [(if b -1 0)])))
+(defn- der-octets ^bytes [^bytes b] (tlv 0x04 b))
+(defn- der-bits ^bytes [^bytes b] (tlv 0x03 (byte-array [0]) b))
+(defn- der-utf8 ^bytes [^String s] (tlv 0x0c (.getBytes s StandardCharsets/UTF_8)))
+(defn- der-explicit ^bytes [tag-num & items] (apply tlv (bit-or 0xa0 tag-num) items))
+
+(defn- der-oid ^bytes [^String oid]
+  (let [[a b & more] (map #(Long/parseLong %) (.split oid "\\."))
+        base128 (fn [^long n]
+                  (loop [acc (list (bit-and n 0x7f))
+                         n (bit-shift-right n 7)]
+                    (if (zero? n) acc (recur (conj acc (bit-or 0x80 (bit-and n 0x7f))) (bit-shift-right n 7)))))]
+    (tlv 0x06 (byte-array (map unchecked-byte (mapcat base128 (cons (+ (* 40 a) b) more)))))))
+
+(defn- der-time ^bytes [^ZonedDateTime t]
+  ;; RFC 5280: UTCTime through 2049, GeneralizedTime from 2050.
+  (let [utc (.withZoneSameInstant t ZoneOffset/UTC)
+        [tag pattern] (if (< (.getYear utc) 2050) [0x17 "yyMMddHHmmss'Z'"] [0x18 "yyyyMMddHHmmss'Z'"])]
+    (tlv tag (.getBytes (.format (DateTimeFormatter/ofPattern pattern) utc) StandardCharsets/US_ASCII))))
+
+;; X.509 building blocks
+
+(def ^:private ecdsa-with-sha256 (der-seq (der-oid "1.2.840.10045.4.3.2")))
+
+(defn- der-name ^bytes [^String common-name]
+  (der-seq (der-set (der-seq (der-oid "2.5.4.3") (der-utf8 common-name)))))
+
+(defn- extension ^bytes [oid critical? ^bytes value]
+  (apply der-seq (remove nil? [(der-oid oid) (when critical? (der-bool true)) (der-octets value)])))
+
+(defn- key-id ^bytes [^KeyPair kp]
+  ;; SHA-1 of the SPKI, truncated to 20 bytes; any stable unique value is fine here.
+  (Arrays/copyOf (.digest (MessageDigest/getInstance "SHA-1") (.getEncoded (.getPublic kp))) 20))
+
+(defn- san-entry ^bytes [s]
+  (if (re-matches #"[0-9.]+|.*:.*" s)
+    (tlv 0x87 (.getAddress (InetAddress/getByName s)))                 ; iPAddress [7]
+    (tlv 0x82 (.getBytes ^String s StandardCharsets/US_ASCII))))       ; dNSName [2]
+
+(defn- extensions [{:keys [ca? subject-kp issuer-kp ext-key-usage sans]}]
+  (der-explicit 3
+    (apply der-seq
+      (remove nil?
+        [(extension "2.5.29.19" true (if ca? (der-seq (der-bool true) (der-int BigInteger/ZERO)) (der-seq)))
+         (extension "2.5.29.15" true (der-bits (byte-array [(unchecked-byte (if ca? 0x06 0x80))]))) ; keyCertSign|cRLSign, or digitalSignature
+         (when ext-key-usage
+           (extension "2.5.29.37" false (der-seq (der-oid ext-key-usage))))
+         (when (seq sans)
+           (extension "2.5.29.17" false (apply der-seq (map san-entry sans))))
+         (extension "2.5.29.14" false (der-octets (key-id subject-kp)))
+         (extension "2.5.29.35" false (der-seq (tlv 0x80 (key-id issuer-kp))))]))))
+
+(defn- generate-key-pair ^KeyPair []
+  (let [kpg (KeyPairGenerator/getInstance "EC")]
+    (.initialize kpg (ECGenParameterSpec. "secp256r1"))
+    (.generateKeyPair kpg)))
+
+(defn- sign ^bytes [^PrivateKey k ^bytes data]
+  (let [sig (Signature/getInstance "SHA256withECDSA")]
+    (.initSign sig k)
+    (.update sig data)
+    (.sign sig)))
+
+(defn- create-certificate
+  ^X509Certificate [{:keys [subject-cn issuer-cn ^KeyPair subject-kp ^KeyPair issuer-kp validity-days] :as opts}]
+  (let [now (ZonedDateTime/now ZoneOffset/UTC)
+        tbs (der-seq
+              (der-explicit 0 (der-int (BigInteger/valueOf 2)))      ; v3
+              (der-int (BigInteger. 159 (SecureRandom.)))
+              ecdsa-with-sha256
+              (der-name issuer-cn)
+              (der-seq (der-time (.minusMinutes now 5)) (der-time (.plusDays now validity-days)))
+              (der-name subject-cn)
+              (.getEncoded (.getPublic subject-kp))                 ; already DER SubjectPublicKeyInfo
+              (extensions opts))
+        cert-der (der-seq tbs ecdsa-with-sha256 (der-bits (sign (.getPrivate issuer-kp) tbs)))
+        cert (.generateCertificate (CertificateFactory/getInstance "X.509") (ByteArrayInputStream. cert-der))]
+    (.verify ^X509Certificate cert (.getPublic issuer-kp))
+    cert))
+
+;; PEM output
+
+(defn- pem [^String label ^bytes der]
+  (str "-----BEGIN " label "-----\n"
+       (.encodeToString (Base64/getMimeEncoder 64 (.getBytes "\n" StandardCharsets/US_ASCII)) der)
+       "\n-----END " label "-----\n"))
+
+(defn generate
+  "Returns a map of PEM strings for a root CA, a server and a client.
+  Options: :validity-days (default 365), :server-names (default [\"localhost\" \"127.0.0.1\" \"::1\"])."
+  ([] (generate {}))
+  ([{:keys [validity-days server-names]
+     :or   {validity-days 365
+            server-names  ["localhost" "127.0.0.1" "::1"]}}]
+   (let [ca-kp (generate-key-pair)
+         ca-cn (str (UUID/randomUUID))
+         leaf (fn [kp extra]
+                (create-certificate (merge {:subject-cn    (str (UUID/randomUUID))
+                                            :subject-kp    kp
+                                            :issuer-cn     ca-cn
+                                            :issuer-kp     ca-kp
+                                            :validity-days validity-days}
+                                           extra)))
+         ca-cert (create-certificate {:ca?           true
+                                      :subject-cn    ca-cn
+                                      :subject-kp    ca-kp
+                                      :issuer-cn     ca-cn
+                                      :issuer-kp     ca-kp
+                                      :validity-days validity-days})
+         server-kp (generate-key-pair)
+         server-cert (leaf server-kp {:ext-key-usage "1.3.6.1.5.5.7.3.1" :sans server-names})
+         client-kp (generate-key-pair)
+         client-cert (leaf client-kp {:ext-key-usage "1.3.6.1.5.5.7.3.2"})
+         key-pem (fn [^KeyPair kp] (pem "PRIVATE KEY" (.getEncoded (.getPrivate kp))))
+         cert-pem (fn [^X509Certificate c] (pem "CERTIFICATE" (.getEncoded c)))]
+     {:root-ca-key  (key-pem ca-kp)
+      :root-ca-cert (cert-pem ca-cert)
+      :server-key   (key-pem server-kp)
+      :server-cert  (cert-pem server-cert)
+      :client-key   (key-pem client-kp)
+      :client-cert  (cert-pem client-cert)})))
+
+
+(defn prepare-file! [f']
+  (when f'
+    (io/delete-file (io/file f') true)
+    (let [f (io/file f')]
+      (spit f' "")
+      (.setExecutable f false)
+      (.setReadable f false false)
+      (.setReadable f true true)
+      (.setWritable f false false)
+      (.setWritable f true true))))
+
+
+(defn unset-writeable! [f]
+  (when f
+    (let [f (io/file f)]
+      (.setWritable f false true))))
+
+
+(defn write-certs-to-file! [_]
+  (let [{:keys [root-ca-key root-ca-cert server-key server-cert client-key client-cert]} (generate)]
+    (doseq [f ["root.keys" "server.keys" "client.keys"]]
+      (prepare-file! f))
+    (spit "root.keys" (str root-ca-key "\n" root-ca-cert) :append true)
+    (spit "server.keys" (str root-ca-cert "\n" server-cert "\n" server-key) :append true)
+    (spit "client.keys" (str root-ca-cert "\n" client-cert "\n" client-key) :append true)
+    (doseq [f ["root.keys" "server.keys" "client.keys"]]
+      (unset-writeable! f))))
+
+
+(defn -main [& _args]
+  (let [{:keys [root-ca-key root-ca-cert server-key server-cert client-key client-cert]} (generate)]
+    (print (str root-ca-key root-ca-cert "\n"
+                server-key server-cert "\n"
+                client-key client-cert))
+    (flush)))
