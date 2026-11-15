@@ -158,7 +158,7 @@
       (.setSoTimeout tls-client 10)
       (.setSoTimeout tcp-echo-sock 10)
       (loop []
-        ;; Read from the plaintext connection
+        ;; Read bytes from the plaintext connection
         (let [n (read-some plaintext-in buf-plaintext)]
           ;; Is it an EOF?
           (if (= -1 n)
@@ -171,30 +171,35 @@
 
               ;; Read bytes back as "TLS bytes"
               (let [n2 (read-some tcp-echo-read buf-tls)]
+                (if (= -1 n2)
+                  (throw (ex-info "Unexpected state: tcp-echo socket is closed" {}))
 
-                ;; Forward the TLS bytes to the remote web server
-                (let [data-hdr {:session session-id :data true}
-                      [hdr chunk] (send-to-remote! web-server-endpoint data-hdr buf-tls n2)]
-                  (cond
-                    (:eof hdr)
-                    {:eof :remote}
+                  ;; Forward the TLS bytes to the remote web server
+                  (let [data-hdr {:session session-id :data true}
+                        [hdr chunk] (send-to-remote! web-server-endpoint data-hdr buf-tls n2)]
+                    (cond
+                      (:eof hdr)
+                      {:eof :remote}
 
-                    (:data hdr)
-                    (do
-                      ;; Write received TLS bytes back to the TCP echo server
-                      (write-all tcp-echo-write chunk)
+                      (:data hdr)
+                      (do
+                        ;; Write received TLS bytes back to the TCP echo server
+                        (write-all tcp-echo-write chunk)
 
-                      ;; Read decrypted TLS back
-                      (let [n3 (read-some tls-client-in buf-plaintext)]
+                        ;; Read decrypted TLS back
+                        (let [n3 (read-some tls-client-in buf-plaintext)]
+                          (if (= -1 n3)
+                            (throw (ex-info "Unexpected state: tls-client socket is closed" {}))
 
-                        ;; Write the decrypted bytes to the plaintext connection
-                        (write-some plaintext-out buf-plaintext n3)
+                            (do
+                              ;; Write the decrypted bytes to the plaintext connection
+                              (write-some plaintext-out buf-plaintext n3)
 
-                        ;; And keep going!
-                        (recur)))
+                              ;; And keep going!
+                              (recur)))))
 
-                    :else
-                    (throw (ex-info "Unexpected state" {:remote-header hdr}))))))))))))
+                      :else
+                      (throw (ex-info "Unexpected state" {:remote-header hdr})))))))))))))
 
 
 (defn run-proxy! [tls-context web-server-endpoint ^Socket plaintext']
