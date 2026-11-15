@@ -1,6 +1,5 @@
 (ns yasp2.mtls-web-proxy-client
-  (:require [clojure.java.io :as io]
-            [nrepl.http :as http]
+  (:require [nrepl.http :as http]
             [nrepl.tls :as tls]
             [yasp2.web-server :as web-server])
   (:import (java.io BufferedInputStream BufferedOutputStream BufferedReader InputStream InputStreamReader OutputStream)
@@ -8,7 +7,7 @@
            (java.net InetSocketAddress ServerSocket Socket SocketTimeoutException)
            (java.nio.charset StandardCharsets)
            (java.util Arrays)
-           (javax.net.ssl SSLServerSocket SSLSocket)))
+           (javax.net.ssl SSLServerSocket)))
 
 (set! *warn-on-reflection* true)
 
@@ -90,6 +89,17 @@
       0)))
 
 
+(defn write-some [^BufferedOutputStream out buf size]
+  (when (>= size 1)
+    (.write out ^byte/1 buf 0 (int size))
+    (.flush out)))
+
+
+(defn write-all [^BufferedOutputStream out buf]
+  (.write out ^byte/1 buf 0 (int (alength ^byte/1 buf)))
+  (.flush out))
+
+
 (defn- tls-handshake-pump [^String web-server-endpoint
                            ^String session-id
                            tls-sock-future
@@ -101,7 +111,6 @@
         buffer (make-array Byte/TYPE buf-size)]
     (loop [n 0
            remote-available? false]
-      (println "Handshake pump" n)
       (let [spent-ms (- (System/currentTimeMillis)
                         start-time)]
         (cond
@@ -119,17 +128,14 @@
                        0
                        (read-some tcp-echo-read buffer))]
             (if (= -1 size)
-              (do
-                (println "EOF reached when reading from tcp-echo")
-                {:error :eof-tcp-echo})
+              {:error :eof-tcp-echo}
               (let [available (.available tcp-echo-read)
                     header {:session   session-id
                             :data      true
                             :available available}]
                 (let [[hdr chunk] (send-to-remote! web-server-endpoint header buffer size)]
                   (println "<<<< Client recv" hdr (alength ^byte/1 chunk))
-                  (io/copy chunk tcp-echo-write)
-                  (.flush tcp-echo-write)
+                  (write-all tcp-echo-write chunk)
                   (if (:eof hdr)
                     {:error :eof-remote-handshake}
                     (recur (inc n) (:available hdr))))))))))))
@@ -152,46 +158,43 @@
       (.setSoTimeout tls-client 10)
       (.setSoTimeout tcp-echo-sock 10)
       (loop []
-        ;; Read from the plaintext connection ...
+        ;; Read from the plaintext connection
         (let [n (read-some plaintext-in buf-plaintext)]
           ;; Is it an EOF?
           (if (= -1 n)
             (do
-              (println "Client proxy: EOF reached")
               (send-to-remote! web-server-endpoint {:session session-id :eof true})
-
               {:eof :client})
             (do
               ;; Forward bytes to the TLS client
-              (when (pos-int? n)
-                (.write tls-client-out buf-plaintext 0 n)
-                (.flush tls-client-out))
+              (write-some tls-client-out buf-plaintext n)
 
               ;; Read bytes back as "TLS bytes"
               (let [n2 (read-some tcp-echo-read buf-tls)]
 
                 ;; Forward the TLS bytes to the remote web server
-                (let [[hdr chunk] (send-to-remote! web-server-endpoint
-                                                   {:session session-id
-                                                    :data    true}
-                                                   buf-tls
-                                                   n2)]
+                (let [data-hdr {:session session-id :data true}
+                      [hdr chunk] (send-to-remote! web-server-endpoint data-hdr buf-tls n2)]
                   (cond
                     (:eof hdr)
                     {:eof :remote}
 
                     (:data hdr)
                     (do
-                      ;; Write the TLS bytes back to the TCP echo server ...
-                      (.write tcp-echo-write ^byte/1 chunk)
-                      (.flush tcp-echo-write)
+                      ;; Write received TLS bytes back to the TCP echo server
+                      (write-all tcp-echo-write chunk)
 
                       ;; Read decrypted TLS back
                       (let [n3 (read-some tls-client-in buf-plaintext)]
+
                         ;; Write the decrypted bytes to the plaintext connection
-                        (.write plaintext-out buf-plaintext 0 (int n3))
-                        (.flush plaintext-out)
-                        (recur)))))))))))))
+                        (write-some plaintext-out buf-plaintext n3)
+
+                        ;; And keep going!
+                        (recur)))
+
+                    :else
+                    (throw (ex-info "Unexpected state" {:remote-header hdr}))))))))))))
 
 
 (defn run-proxy! [tls-context web-server-endpoint ^Socket plaintext']
@@ -229,13 +232,18 @@
 
               (:sock tls-client1)
               (with-open [^Socket tls-client' (:sock tls-client1)]
-                (tls-pump web-server-endpoint
-                          session-id
-                          plaintext'
-                          tcp-echo-sock
-                          tcp-echo-read
-                          tcp-echo-write
-                          tls-client'))
+                (try
+                  (tls-pump web-server-endpoint
+                            session-id
+                            plaintext'
+                            tcp-echo-sock
+                            tcp-echo-read
+                            tcp-echo-write
+                            tls-client')
+                  (catch Exception e
+                    {:error     :tls-pump
+                     :exception e})))
+
               :else
               (throw (ex-info "Unexpected state" {:tls-client tls-client1})))))))
     (finally
