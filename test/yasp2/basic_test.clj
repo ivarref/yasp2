@@ -105,18 +105,17 @@
       (throw e))))
 
 
-(defn uppercase-loop! [^Socket s]
-  (with-open [_s s]
-    (let [in (BufferedReader. (InputStreamReader. (.getInputStream s) StandardCharsets/UTF_8))
-          out (BufferedWriter. (OutputStreamWriter. (.getOutputStream s) StandardCharsets/UTF_8))]
-      (loop []
-        (when-let [lin (.readLine in)]
-          (.write out (str/upper-case lin))
-          (.write out "\n")
-          (.flush out))))))
+(defn uppercase-handler! [^Socket s]
+  (let [in (BufferedReader. (InputStreamReader. (.getInputStream s) StandardCharsets/UTF_8))
+        out (BufferedWriter. (OutputStreamWriter. (.getOutputStream s) StandardCharsets/UTF_8))]
+    (loop []
+      (when-let [lin (.readLine in)]
+        (.write out (str/upper-case lin))
+        (.write out "\n")
+        (.flush out)))))
 
 
-(defn start-uppercase-echo-server! [server-keys-file]
+(defn start-tls-server! [server-keys-file conn-handler]
   (let [server-ctx (tls/ssl-str-context (slurp server-keys-file))
         futures-count (atom 0)]
     (let [^SSLServerSocket server (tls/server-socket server-ctx "127.0.0.1" 0)
@@ -129,8 +128,9 @@
                                              (future
                                                (try
                                                  (swap! futures-count inc)
-                                                 (uppercase-loop! sock)
+                                                 (conn-handler sock)
                                                  (finally
+                                                   (tls/close-silently sock)
                                                    (swap! futures-count dec))))
                                              true)
                                            (catch SocketException e
@@ -155,7 +155,7 @@
 (deftest eof-remote
   (try
     (let [result-promise (promise)]
-      (with-open [^AutoCloseable tls-server (start-uppercase-echo-server! "server.keys")
+      (with-open [^AutoCloseable tls-server (start-tls-server! "server.keys" uppercase-handler!)
                   ^AutoCloseable web-server (web-server/start-web-server!
                                               (atom {}) (port-of tls-server))
                   ^AutoCloseable plaintext-server (client/start-proxy-server!
@@ -176,7 +176,41 @@
             (is (= "HELLO" (.readLine in)))
             (.write out (.getBytes "yolo\n" StandardCharsets/UTF_8))
             (.flush out)))
-        (is (= {:eof :remote} @result-promise))))
+        (is (= {:eof :remote-tls} @result-promise))))
+    (catch Exception e
+      (println "Error:" (ex-message e))
+      (throw e))))
+
+
+(deftest client-disconnected
+  (try
+    (let [result-promise (promise)]
+      (with-open [^AutoCloseable tls-server (start-tls-server!
+                                              "server.keys"
+                                              (fn [sock]
+                                                (let [out (BufferedOutputStream. (.getOutputStream sock))]
+                                                  (loop []
+                                                    (.write out (.getBytes "hello\n" StandardCharsets/UTF_8))
+                                                    (.flush out)
+                                                    (recur)))))
+                  ^AutoCloseable web-server (web-server/start-web-server!
+                                              (atom {}) (port-of tls-server))
+                  ^AutoCloseable plaintext-server (client/start-proxy-server!
+                                                    "client.keys"
+                                                    (str "http://127.0.0.1:"
+                                                         (port-of web-server)
+                                                         "/nrepl")
+                                                    result-promise
+                                                    true)]
+        (with-open [^Socket client (Socket. "127.0.0.1" ^int (port-of plaintext-server))]
+          (let [in (-> (.getInputStream client)
+                       (InputStreamReader. StandardCharsets/UTF_8)
+                       (BufferedReader.))
+                out (BufferedOutputStream. (.getOutputStream client))]
+            (.setSoTimeout client 5000)
+            (.close in)
+            #_(Thread/sleep 1000)))
+        (is (= {:eof :client-disconnected} @result-promise))))
     (catch Exception e
       (println "Error:" (ex-message e))
       (throw e))))

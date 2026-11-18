@@ -244,7 +244,7 @@
                            ;; Ignore exceptions if client is gone
                            true))]
       (cond
-        (= :closed engine-state) {:eof :remote}
+        (= :closed engine-state) {:eof :remote-tls}
         client-gone? {:eof :client-disconnected}
         :else
         (let [n (read-some plain-in buf)]
