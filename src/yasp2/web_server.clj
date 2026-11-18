@@ -144,5 +144,10 @@
     (with-meta
       (reify AutoCloseable
         (close [_]
-          (.stop server 0)))
+          (.stop server 0)
+          (let [web-server-shutdown (future
+                                      (while (not (empty? (keys (get @state-atom :session))))
+                                        (Thread/sleep 10)))]
+            (when (= :timeout (deref web-server-shutdown 10000 :timeout))
+              (throw (ex-info "Timeout waiting for web server to shutdown" {}))))))
       {:port (.getPort (.getAddress server))})))

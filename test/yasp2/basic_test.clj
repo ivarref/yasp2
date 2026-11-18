@@ -1,10 +1,11 @@
 (ns yasp2.basic-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.string :as str]
+            [clojure.test :refer :all]
             [nrepl.tls :as tls]
             [yasp2.mtls-web-proxy-client :as client]
             [yasp2.web-server :as web-server])
   (:import (java.io BufferedInputStream BufferedOutputStream BufferedReader
-                    InputStream InputStreamReader OutputStream)
+                    BufferedWriter InputStream InputStreamReader OutputStream OutputStreamWriter)
            (java.lang AutoCloseable)
            (java.net ServerSocket Socket SocketException)
            (java.nio.charset StandardCharsets)
@@ -83,7 +84,8 @@
                                                     (str "http://127.0.0.1:"
                                                          (port-of web-server)
                                                          "/nrepl")
-                                                    result-promise)]
+                                                    result-promise
+                                                    true)]
         (with-open [^Socket client (Socket. "127.0.0.1" ^int (port-of plaintext-server))
                     in (-> (.getInputStream client)
                            (InputStreamReader. StandardCharsets/UTF_8)
@@ -97,16 +99,9 @@
           (.write out (.getBytes "Yolo\n" StandardCharsets/UTF_8))
           (.flush out)
           (is (= "Yolo" (.readLine in)))
-          (is (= 1 (count (keys (get @web-server-state :session))))))
-        (let [web-server-shutdown (future
-                                    (while (not (empty? (keys (get @web-server-state :session))))
-                                      (Thread/sleep 10)))]
-          (when (= :timeout (deref web-server-shutdown 10000 :timeout))
-            (println "Timeout waiting for web server to shutdown"))))
+          (is (= 1 (count (keys (get @web-server-state :session)))))))
       (while (not= 0 @futures)
         (Thread/sleep 10))
-      (when (= :timeout (deref result-promise 10000 :timeout))
-        (throw (ex-info "Timeout waiting for result-promise" {})))
       (is (= {:eof :client}
              @result-promise)))
     (catch Exception e
@@ -115,14 +110,20 @@
 
 
 (defn uppercase-loop! [^Socket s]
-  (with-open [_s s
-              in (BufferedInputStream. (.getInputStream s))
-              out (BufferedOutputStream. (.getOutputStream s))]
-    (do-copy in out)))
+  (with-open [_s s]
+    (let [in (BufferedReader. (InputStreamReader. (.getInputStream s) StandardCharsets/UTF_8))
+          out (BufferedWriter. (OutputStreamWriter. (.getOutputStream s) StandardCharsets/UTF_8))]
+      (loop []
+        (when-let [lin (.readLine in)]
+          (.write out (str/upper-case lin))
+          (.write out "\n")
+          (.flush out)
+          (recur))))))
 
 
-(defn start-uppercase-echo-server! [futures-count server-keys-file]
-  (let [server-ctx (tls/ssl-str-context (slurp server-keys-file))]
+(defn start-uppercase-echo-server! [server-keys-file]
+  (let [server-ctx (tls/ssl-str-context (slurp server-keys-file))
+        futures-count (atom 0)]
     (let [^SSLServerSocket server (tls/server-socket server-ctx "127.0.0.1" 0)
           accept-loop (future
                         (try
@@ -159,39 +160,27 @@
 (deftest client-disconnect
   (try
     (let [web-server-state (atom {})
-          result-promise (promise)
-          futures (atom 0)]
-      (with-open [^AutoCloseable tls-server (start-tls-echo-server! futures "server.keys")
+          result-promise (promise)]
+      (with-open [^AutoCloseable tls-server (start-uppercase-echo-server! "server.keys")
                   ^AutoCloseable web-server (web-server/start-web-server!
                                               web-server-state
-                                              (-> tls-server meta :port))
+                                              (port-of tls-server))
                   ^AutoCloseable plaintext-server (client/start-proxy-server!
                                                     "client.keys"
                                                     (str "http://127.0.0.1:"
-                                                         (-> web-server meta :port)
+                                                         (port-of web-server)
                                                          "/nrepl")
-                                                    result-promise)]
-        (with-open [^Socket client (Socket. "127.0.0.1" ^int (-> plaintext-server meta :port))]
+                                                    result-promise
+                                                    true)]
+        (with-open [^Socket client (Socket. "127.0.0.1" ^int (port-of plaintext-server))]
           (let [in (-> (.getInputStream client)
                        (InputStreamReader. StandardCharsets/UTF_8)
                        (BufferedReader.))
                 out (BufferedOutputStream. (.getOutputStream client))]
             (.setSoTimeout client 5000)
-            (.write out (.getBytes "Hello ÆØÅ\n" StandardCharsets/UTF_8))
+            (.write out (.getBytes "hello\n" StandardCharsets/UTF_8))
             (.flush out)
-            #_(is (= "Hello ÆØÅ" (.readLine in)))))
-        (let [web-server-shutdown (future
-                                    (while (not (empty? (keys (get @web-server-state :session))))
-                                      (Thread/sleep 10)))]
-          (when (= :timeout (deref web-server-shutdown 10000 :timeout))
-            (println "Timeout waiting for web server to shutdown"))))
-      (while (not= 0 @futures)
-        (Thread/sleep 10))
-      (when (= :timeout (deref result-promise 10000 :timeout))
-        (throw (ex-info "Timeout waiting for result-promise" {})))
-      (println @result-promise)
-      #_(is (= {:eof :client}
-               @result-promise)))
+            (is (= "HELLO" (.readLine in)))))))
     (catch Exception e
       (println "Error:" (ex-message e))
       (throw e))))
