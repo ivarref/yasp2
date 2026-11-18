@@ -184,14 +184,88 @@
   (bytebuffer-drain-to-byte-array net-out))
 
 
+(defn data-loop! [^String session-id
+                  ^String web-server-endpoint
+                  ^SSLEngine engine
+                  ^BufferedInputStream plain-in
+                  ^BufferedOutputStream plain-out
+                  ^ByteBuffer app-in
+                  ^ByteBuffer app-out
+                  ^ByteBuffer net-in
+                  ^ByteBuffer net-out
+                  ^byte/1 buf
+                  buf-size]
+  (loop [remote-chunk (make-array Byte/TYPE 0)]
+    ;; On initial loop: copy whatever might be in net-in to app-in
+    ;; Regular loop: copy net-in + remote-chunk to app-in
+    (let [engine-state (unwraps! engine net-in app-in remote-chunk)
+          ;; Copy app-in (decrypted bytebuffer) to the plaintext outputstream
+          client-gone? (try
+                         (.write plain-out ^byte/1 (bytebuffer-drain-to-byte-array app-in))
+                         (.flush plain-out)
+                         false
+                         (catch IOException _
+                           ;; Ignore exceptions if client is gone
+                           true))]
+      (cond
+        (= :closed engine-state) {:eof :remote}
+        client-gone? {:eof :client-disconnected}
+        :else
+        (let [n (read-some plain-in buf)]
+          (if (= n -1)
+            ;; We are done reading from plaintext in
+            ;; Close the TLS session:
+            (loop [start-ms (System/currentTimeMillis)
+                   out (close-outbound! engine net-out)]
+              (let [[hdr byte-chunk] (http/post
+                                       web-server-endpoint
+                                       {:session  session-id
+                                        :data     true
+                                        :buf-size buf-size}
+                                       out)
+                    engine-state (unwraps! engine net-in app-in byte-chunk)
+                    spent-ms (- (System/currentTimeMillis) start-ms)
+                    exception? (try
+                                 (.write plain-out
+                                         ^byte/1 (bytebuffer-drain-to-byte-array app-in))
+                                 (.flush plain-out)
+                                 false
+                                 (catch IOException _
+                                   true))]
+                (if (or (:eof hdr)
+                        (= :closed engine-state)
+                        (> spent-ms 5000)
+                        exception?)
+                  {:eof :client}
+                  (do
+                    (when (zero? (alength ^byte/1 byte-chunk))
+                      (Thread/sleep 10))
+                    (recur start-ms (byte-array 0))))))
+            (do
+              (wraps! engine app-out net-out (^[byte/1 int] Arrays/copyOf buf (int n)))
+              (let [net-out' (bytebuffer-drain-to-byte-array net-out)
+                    [hdr byte-chunk] (http/post
+                                       web-server-endpoint
+                                       {:session  session-id
+                                        :data     true
+                                        :buf-size buf-size}
+                                       net-out')]
+                (if (:eof hdr)
+                  {:eof :remote}
+                  (recur byte-chunk))))))))))
+
+
 ;; Based on https://docs.oracle.com/javase/8/docs/technotes/guides/security//jsse/samples/sslengine/SSLEngineSimpleDemo.java
-;; The JDK docs
+;; The JDK docs:
+;; https://docs.oracle.com/javase/8/docs/api/javax/net/ssl/SSLEngine.html
+;; https://docs.oracle.com/javase/8/docs/api/javax/net/ssl/SSLEngineResult.HandshakeStatus.html
+;; https://docs.oracle.com/javase/8/docs/api/java/nio/ByteBuffer.html
 ;; And plenty of help from Claude Code as well
 (defn run-proxy! [^SSLContext tls-context web-server-endpoint ^Socket plaintext]
-  (let [session-id (str (random-uuid))
-        ^SSLEngine engine (.createSSLEngine tls-context)]
+  (let [session-id (str (random-uuid))]
     (try
-      (let [_ (.setUseClientMode engine true)
+      (let [^SSLEngine engine (.createSSLEngine tls-context)
+            _ (.setUseClientMode engine true)
             _ (.setEnabledProtocols engine (into-array String ["TLSv1.3"]))
             session (.getSession engine)
             buf-size (max (.getApplicationBufferSize session) (.getPacketBufferSize session))
@@ -206,64 +280,17 @@
         (let [plain-in (BufferedInputStream. (.getInputStream plaintext))
               plain-out (BufferedOutputStream. (.getOutputStream plaintext))
               buf (byte-array (int buf-size))]
-          (loop [remote-chunk (make-array Byte/TYPE 0)]
-            ;; On initial loop: copy whatever might be in net-in to app-in
-            ;; Regular loop: copy net-in + remote-chunk to app-in
-            (let [engine-state (unwraps! engine net-in app-in remote-chunk)
-                  ;; Copy app-in (decrypted bytebuffer) to the plaintext outputstream
-                  client-gone? (try
-                                 (.write plain-out ^byte/1 (bytebuffer-drain-to-byte-array app-in))
-                                 (.flush plain-out)
-                                 false
-                                 (catch IOException _
-                                   ;; Ignore exceptions if client is gone
-                                   true))]
-              (cond
-                (= :closed engine-state) {:eof :remote}
-                client-gone? {:eof :client-disconnected}
-                :else
-                (let [n (read-some plain-in buf)]
-                  (if (= n -1)
-                    ;; We are done reading from plaintext in
-                    ;; Close the TLS session:
-                    (loop [start-ms (System/currentTimeMillis)
-                           out (close-outbound! engine net-out)]
-                      (let [[hdr byte-chunk] (http/post
-                                               web-server-endpoint
-                                               {:session  session-id
-                                                :data     true
-                                                :buf-size buf-size}
-                                               out)
-                            engine-state (unwraps! engine net-in app-in byte-chunk)
-                            spent-ms (- (System/currentTimeMillis) start-ms)
-                            exception? (try
-                                         (.write plain-out
-                                                 ^byte/1 (bytebuffer-drain-to-byte-array app-in))
-                                         (.flush plain-out)
-                                         false
-                                         (catch IOException _
-                                           true))]
-                        (if (or (:eof hdr)
-                                (= :closed engine-state)
-                                (> spent-ms 5000)
-                                exception?)
-                          {:eof :client}
-                          (do
-                            (when (zero? (alength ^byte/1 byte-chunk))
-                              (Thread/sleep 10))
-                            (recur start-ms (byte-array 0))))))
-                    (do
-                      (wraps! engine app-out net-out (^[byte/1 int] Arrays/copyOf buf (int n)))
-                      (let [net-out' (bytebuffer-drain-to-byte-array net-out)
-                            [hdr byte-chunk] (http/post
-                                               web-server-endpoint
-                                               {:session  session-id
-                                                :data     true
-                                                :buf-size buf-size}
-                                               net-out')]
-                        (if (:eof hdr)
-                          {:eof :remote}
-                          (recur byte-chunk)))))))))))
+          (data-loop! session-id
+                      web-server-endpoint
+                      engine
+                      plain-in
+                      plain-out
+                      app-in
+                      app-out
+                      net-in
+                      net-out
+                      buf
+                      buf-size)))
       (finally
         (try
           (http/post web-server-endpoint
@@ -288,7 +315,17 @@
                   (deliver result-promise res)))
               (catch Exception e
                 (println ">>>> Local plaintext TCP->Web proxy crashed:" (ex-message e))
-                (.printStackTrace e)))))
+                (.printStackTrace e)
+                (when result-promise
+                  (deliver result-promise {:unexpected-error true
+                                           :ee               e}))))))
         (recur)))
-    server))
+    (with-meta
+      (reify AutoCloseable
+        (close [_]
+          (tls/close-silently server)
+          (when result-promise
+            (when (= :timeout (deref result-promise 10000 :timeout))
+              (throw (ex-info "Timeout waiting for result-promise" {}))))))
+      {:port (.getLocalPort server)})))
 
