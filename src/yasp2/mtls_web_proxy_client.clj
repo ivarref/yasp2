@@ -2,12 +2,13 @@
   (:require [nrepl.http :as http]
             [nrepl.tls :as tls]
             [yasp2.web-server :as web-server])
-  (:import (java.io BufferedInputStream BufferedOutputStream BufferedReader InputStream InputStreamReader OutputStream)
+  (:import (java.io BufferedInputStream BufferedOutputStream BufferedReader InputStream InputStreamReader IOException OutputStream)
            (java.lang AutoCloseable)
            (java.net InetSocketAddress ServerSocket Socket SocketTimeoutException)
+           (java.nio ByteBuffer)
            (java.nio.charset StandardCharsets)
            (java.util Arrays)
-           (javax.net.ssl SSLServerSocket)))
+           (javax.net.ssl SSLContext SSLEngine SSLEngineResult SSLEngineResult$HandshakeStatus SSLEngineResult$Status SSLServerSocket)))
 
 (set! *warn-on-reflection* true)
 
@@ -20,25 +21,6 @@
 ;; * is there more bytes available?
 ;; * session id
 ;; * EOF?
-
-
-;; The implementation of the client:
-;; The client opens a TCP server that will take plaintext nREPL commands in.
-;; A single thread will be used for each accepted connection.
-
-;; Per connection:
-;; On init, the connection thread does:
-;; Create an interim TCP echo server.
-;; Connect a TLS client to the echo server.
-;; Closes the echo server, but let echo connection stay open.
-
-;; The connection thread now holds 3 sockets (6 streams):
-;; the plaintext
-;; the TLS client
-;; the TCP echo connection
-
-;; When creating a TLS client, it will (probably) send a bunch of bytes
-;; on connect
 
 
 (def buf-size 65536)
@@ -73,186 +55,254 @@
       server)))
 
 
-(defn send-to-remote!
-  ([web-server-endpoint header]
-   (http/post web-server-endpoint header))
-  ([web-server-endpoint header buffer siz]
-   (println ">>>> Client send" header (alength ^byte/1 buffer))
-   (let [buf' (^[byte/1 int] Arrays/copyOf buffer (int siz))]
-     (http/post web-server-endpoint header buf'))))
-
-
 (defn read-some [^BufferedInputStream in ^byte/1 buf]
   (try
     (.read in buf)
     (catch SocketTimeoutException _ste
-      0)))
+      0)
+    (catch IOException _ioe
+      -1)))
 
 
-(defn write-some [^BufferedOutputStream out buf size]
-  (when (>= size 1)
-    (.write out ^byte/1 buf 0 (int size))
-    (.flush out)))
+(defn run-delegated-tasks [^SSLEngine engine]
+  (while (= SSLEngineResult$HandshakeStatus/NEED_TASK (.getHandshakeStatus engine))
+    (when-let [^Runnable task (.getDelegatedTask engine)]
+      (.run task))))
 
 
-(defn write-all [^BufferedOutputStream out buf]
-  (.write out ^byte/1 buf 0 (int (alength ^byte/1 buf)))
-  (.flush out))
+(defn bytebuffer-drain-to-byte-array
+  "Copies the bytes written so far (0 .. position) to a byte array. Clears input byte buffer afterwards."
+  [^ByteBuffer buf]
+  (let [_ (.flip buf)
+        arr (byte-array (.remaining buf))]
+    (.get ^ByteBuffer buf arr)
+    (.clear buf)
+    arr))
 
 
-(defn- tls-handshake-pump [^String web-server-endpoint
-                           ^String session-id
-                           tls-sock-future
-                           ^Socket tcp-echo-sock
-                           ^BufferedInputStream tcp-echo-read
-                           ^BufferedOutputStream tcp-echo-write]
-  (.setSoTimeout tcp-echo-sock 1000)
-  (let [start-time (System/currentTimeMillis)
-        buffer (make-array Byte/TYPE buf-size)]
-    (loop [n 0
-           remote-available? false]
-      (let [spent-ms (- (System/currentTimeMillis)
-                        start-time)]
-        (cond
-          (> spent-ms 60000)
-          (do
-            (println "Spent too long time to establish mTLS connection")
-            {:error :handshake-timeout})
+(defn check-engine-result! [^SSLEngineResult res]
+  (let [status (.getStatus res)]
+    (cond
+      (= SSLEngineResult$Status/OK status)
+      :ok
 
-          (realized? tls-sock-future)
-          @tls-sock-future
+      (= SSLEngineResult$Status/BUFFER_OVERFLOW status)
+      (throw (ex-info "Got SSLEngineResult$Status/BUFFER_OVERFLOW" {}))
 
-          :else
-          (let [size (if (and remote-available? (= 0 (.available tcp-echo-read)))
-                       ; don't do a blocking read if the remote has more data coming
-                       0
-                       (read-some tcp-echo-read buffer))]
-            (if (= -1 size)
-              {:error :eof-tcp-echo}
-              (let [available (.available tcp-echo-read)
-                    header {:session   session-id
-                            :data      true
-                            :available available}]
-                (let [[hdr chunk] (send-to-remote! web-server-endpoint header buffer size)]
-                  (println "<<<< Client recv" hdr (alength ^byte/1 chunk))
-                  (write-all tcp-echo-write chunk)
-                  (if (:eof hdr)
-                    {:error :eof-remote-handshake}
-                    (recur (inc n) (:available hdr))))))))))))
+      (= SSLEngineResult$Status/BUFFER_UNDERFLOW status)
+      :underflow
+
+      (= SSLEngineResult$Status/CLOSED status)
+      :closed)))
 
 
-(defn tls-pump [^String web-server-endpoint
-                ^String session-id
-                ^Socket plaintext
-                ^Socket tcp-echo-sock
-                ^BufferedInputStream tcp-echo-read
-                ^BufferedOutputStream tcp-echo-write
-                ^Socket tls-client]
-  (let [buf-plaintext (make-array Byte/TYPE buf-size)
-        buf-tls (make-array Byte/TYPE (* 4 buf-size))]
-    (with-open [plaintext-in (BufferedInputStream. (.getInputStream plaintext))
-                plaintext-out (BufferedOutputStream. (.getOutputStream plaintext))
-                tls-client-in (BufferedInputStream. (.getInputStream tls-client))
-                tls-client-out (BufferedOutputStream. (.getOutputStream tls-client))]
-      (.setSoTimeout plaintext 1000)
-      (.setSoTimeout tls-client 10)
-      (.setSoTimeout tcp-echo-sock 10)
-      (loop []
-        ;; Read bytes from the plaintext connection
-        (let [n (read-some plaintext-in buf-plaintext)]
-          ;; Is it an EOF?
-          (if (= -1 n)
-            (do
-              (send-to-remote! web-server-endpoint {:session session-id :eof true})
-              {:eof :client})
-            (do
-              ;; Forward bytes to the TLS client
-              (write-some tls-client-out buf-plaintext n)
-
-              ;; Read bytes back as "TLS bytes"
-              (let [n2 (read-some tcp-echo-read buf-tls)]
-                (if (= -1 n2)
-                  (throw (ex-info "Unexpected state: tcp-echo socket is closed" {}))
-
-                  ;; Forward the TLS bytes to the remote web server
-                  (let [data-hdr {:session session-id :data true}
-                        [hdr chunk] (send-to-remote! web-server-endpoint data-hdr buf-tls n2)]
-                    (cond
-                      (:eof hdr)
-                      {:eof :remote}
-
-                      (:data hdr)
-                      (do
-                        ;; Write received TLS bytes back to the TCP echo server
-                        (write-all tcp-echo-write chunk)
-
-                        ;; Read decrypted TLS back
-                        (let [n3 (read-some tls-client-in buf-plaintext)]
-                          (if (= -1 n3)
-                            (throw (ex-info "Unexpected state: tls-client socket is closed" {}))
-
-                            (do
-                              ;; Write the decrypted bytes to the plaintext connection
-                              (write-some plaintext-out buf-plaintext n3)
-
-                              ;; And keep going!
-                              (recur)))))
-
-                      :else
-                      (throw (ex-info "Unexpected state" {:remote-header hdr})))))))))))))
+(defn handshake-drain-wraps! [^SSLEngine engine ^ByteBuffer net-out]
+  ;; This will generate handshake bytes to send to the remote
+  (while (= SSLEngineResult$HandshakeStatus/NEED_WRAP (.getHandshakeStatus engine))
+    (let [^SSLEngineResult res (.wrap engine (ByteBuffer/allocate 0) net-out)]
+      (check-engine-result! res)
+      (run-delegated-tasks engine)))
+  (bytebuffer-drain-to-byte-array net-out))
 
 
-(defn run-proxy! [tls-context web-server-endpoint ^Socket plaintext']
-  ;; plaintext connection established
+(defn handshake-feed-unwraps! [^SSLEngine engine
+                               ^ByteBuffer net-in
+                               ^ByteBuffer app-in
+                               ^byte/1 chunk]
+  ;; Push data received from the remote to the SSLEngine
+  (.put net-in chunk)
+  (.flip net-in)
   (try
-    (let [interim-echo-server (ServerSocket.)
-          _ (.bind interim-echo-server (InetSocketAddress. "127.0.0.1" 0))
-          echo-port (.getLocalPort interim-echo-server)]
-      (let [tls-client (future
-                         (try
-                           (let [sock (tls/socket tls-context "127.0.0.1" echo-port 60000)]
-                             {:sock sock})
-                           (catch Exception e
-                             (println "Could not create tls-client:" (ex-message e))
-                             {:error e})))]
-        (with-open [tcp-echo-sock (.accept interim-echo-server)
-                    tcp-echo-read (BufferedInputStream. (.getInputStream tcp-echo-sock))
-                    tcp-echo-write (BufferedOutputStream. (.getOutputStream tcp-echo-sock))]
-          (tls/close-silently interim-echo-server)
-          (let [session-id (str (random-uuid))
-                ;; Establish mTLS connection.
-                ;; The TLS client will send some bytes to the echo server.
-                ;; We send those bytes to the remote and keep the pump going
-                ;; until the tls-client is returned
-                tls-client1 (tls-handshake-pump
-                              web-server-endpoint
-                              session-id
-                              tls-client
-                              tcp-echo-sock
-                              tcp-echo-read
-                              tcp-echo-write)]
-            (cond
-              (:error tls-client1)
-              tls-client1
-
-              (:sock tls-client1)
-              (with-open [^Socket tls-client' (:sock tls-client1)]
-                (try
-                  (tls-pump web-server-endpoint
-                            session-id
-                            plaintext'
-                            tcp-echo-sock
-                            tcp-echo-read
-                            tcp-echo-write
-                            tls-client')
-                  (catch Exception e
-                    {:error     :tls-pump
-                     :exception e})))
-
-              :else
-              (throw (ex-info "Unexpected state" {:tls-client tls-client1})))))))
+    (loop []
+      ;; leftover bytes after the handshake is stored in net-in
+      (when (and (.hasRemaining net-in)
+                 (= SSLEngineResult$HandshakeStatus/NEED_UNWRAP (.getHandshakeStatus engine)))
+        (let [^SSLEngineResult res (.unwrap engine net-in app-in)]
+          (run-delegated-tasks engine)
+          (when (and (= :ok (check-engine-result! res))
+                     (pos-int? (.bytesConsumed res)))
+            (recur)))))
     (finally
-      (tls/close-silently plaintext'))))
+      (.compact net-in))))
+
+
+(defn unwraps! [^SSLEngine engine
+                ^ByteBuffer net-in
+                ^ByteBuffer app-in
+                ^byte/1 chunk]
+  ;; Push data received from net-in to app-in (via SSLEngine)
+  (.put net-in chunk)
+  (.flip net-in)
+  (try
+    (loop []
+      (when (.hasRemaining net-in)
+        (let [^SSLEngineResult res (.unwrap engine net-in app-in)]
+          (run-delegated-tasks engine)
+          (check-engine-result! res)
+          (when (pos-int? (.bytesConsumed res))
+            (recur)))))
+    (if (.isInboundDone engine)
+      ;; TLS shutdown/close received
+      :closed
+      :open)
+    (finally
+      (.compact net-in))))
+
+
+(defn wraps! [^SSLEngine engine
+              ^ByteBuffer app-out
+              ^ByteBuffer net-out
+              ^byte/1 chunk]
+  ;; Push data received from the plaintext to the SSLEngine
+  (.put app-out chunk)
+  (.flip app-out)
+  (try
+    (loop []
+      (when (or (.hasRemaining app-out)
+                (= SSLEngineResult$HandshakeStatus/NEED_WRAP (.getHandshakeStatus engine)))
+        (let [^SSLEngineResult res (.wrap engine app-out net-out)]
+          (run-delegated-tasks engine)
+          (when (and (= :ok (check-engine-result! res))
+                     (or (pos-int? (.bytesConsumed res))
+                         (pos-int? (.bytesProduced res))))
+            (recur)))))
+    (finally
+      (.compact app-out))))
+
+
+(defn handshake! [^String session-id
+                  buf-size
+                  ^SSLEngine engine ^String web-server-endpoint
+                  ^ByteBuffer net-in ^ByteBuffer net-out
+                  ^ByteBuffer app-in]
+  (.beginHandshake engine)
+  (loop [start-ms (System/currentTimeMillis)]
+    (let [spent-ms (- (System/currentTimeMillis)
+                      start-ms)]
+      (if (> spent-ms 30000)
+        (throw (ex-info "Spent too long handshaking" {}))
+        (let [handshake-status (.getHandshakeStatus engine)]
+          (if (or (= SSLEngineResult$HandshakeStatus/FINISHED handshake-status)
+                  (= SSLEngineResult$HandshakeStatus/NOT_HANDSHAKING handshake-status))
+            :done
+            (do
+              (let [out-bytes (handshake-drain-wraps! engine net-out)
+                    hdr {:session  session-id
+                         :data     true
+                         :buf-size buf-size}
+                    [hdr-remote chunk] (http/post web-server-endpoint
+                                                  hdr
+                                                  out-bytes)]
+                (when (:eof hdr-remote)
+                  (throw (ex-info "Remote sent EOF during handshake" {})))
+                (handshake-feed-unwraps! engine net-in app-in chunk)
+                (when (.isInboundDone engine)
+                  (throw (ex-info "Remote closed TLS during handshake" {})))
+                (when (= 0 (alength ^byte/1 chunk))
+                  (Thread/sleep 10))
+                (recur start-ms)))))))))
+
+
+(defn close-outbound!
+  [^SSLEngine engine ^ByteBuffer net-out]
+  (.closeOutbound engine)
+  (let [empty (ByteBuffer/allocate 0)]
+    (loop []
+      (when-not (.isOutboundDone engine)
+        (let [res (.wrap engine empty net-out)]
+          (check-engine-result! res)
+          (when (pos-int? (.bytesProduced res))
+            (recur))))))
+  (bytebuffer-drain-to-byte-array net-out))
+
+
+;; Based on https://docs.oracle.com/javase/8/docs/technotes/guides/security//jsse/samples/sslengine/SSLEngineSimpleDemo.java
+;; The JDK docs
+;; And plenty of help from Claude Code as well
+(defn run-proxy! [^SSLContext tls-context web-server-endpoint ^Socket plaintext]
+  (let [session-id (str (random-uuid))
+        ^SSLEngine engine (.createSSLEngine tls-context)]
+    (try
+      (let [_ (.setUseClientMode engine true)
+            _ (.setEnabledProtocols engine (into-array String ["TLSv1.3"]))
+            session (.getSession engine)
+            buf-size (max (.getApplicationBufferSize session) (.getPacketBufferSize session))
+            buffer-max (* 4 buf-size)
+            app-in (ByteBuffer/allocate buffer-max)
+            app-out (ByteBuffer/allocate buffer-max)
+            net-in (ByteBuffer/allocate buffer-max)
+            net-out (ByteBuffer/allocate buffer-max)]
+        ;; Do the TLS handshake first
+        (handshake! session-id buf-size engine web-server-endpoint net-in net-out app-in)
+        (.setSoTimeout plaintext 1000)
+        (let [plain-in (BufferedInputStream. (.getInputStream plaintext))
+              plain-out (BufferedOutputStream. (.getOutputStream plaintext))
+              buf (byte-array (int buf-size))]
+          (loop [remote-chunk (make-array Byte/TYPE 0)]
+            ;; On initial loop: copy whatever might be in net-in to app-in
+            ;; Regular loop: copy net-in + remote-chunk to app-in
+            (let [engine-state (unwraps! engine net-in app-in remote-chunk)
+                  ;; Copy app-in (decrypted bytebuffer) to the plaintext outputstream
+                  client-gone? (try
+                                 (.write plain-out ^byte/1 (bytebuffer-drain-to-byte-array app-in))
+                                 (.flush plain-out)
+                                 false
+                                 (catch IOException _
+                                   ;; Ignore exceptions if client is gone
+                                   true))]
+              (cond
+                (= :closed engine-state) {:eof :remote}
+                client-gone? {:eof :client-disconnected}
+                :else
+                (let [n (read-some plain-in buf)]
+                  (if (= n -1)
+                    ;; We are done reading from plaintext in
+                    (loop [start-ms (System/currentTimeMillis)
+                           out (close-outbound! engine net-out)]
+                      (let [[hdr chunk] (http/post
+                                          web-server-endpoint
+                                          {:session  session-id
+                                           :data     true
+                                           :buf-size buf-size}
+                                          out)
+                            engine-state (unwraps! engine net-in app-in chunk)
+                            spent-ms (- (System/currentTimeMillis) start-ms)
+                            exception? (try
+                                         (.write plain-out
+                                                 ^byte/1 (bytebuffer-drain-to-byte-array app-in))
+                                         (.flush plain-out)
+                                         false
+                                         (catch IOException _
+                                           true))]
+                        (if (or (:eof hdr)
+                                (= :closed engine-state)
+                                (> spent-ms 5000)
+                                exception?)
+                          {:eof :client}
+                          (do
+                            (when (zero? (alength ^byte/1 chunk))
+                              (Thread/sleep 10))
+                            (recur start-ms (byte-array 0))))))
+                    (do
+                      (wraps! engine app-out net-out (^[byte/1 int] Arrays/copyOf buf (int n)))
+                      (let [net-out' (bytebuffer-drain-to-byte-array net-out)
+                            [hdr chunk] (http/post
+                                          web-server-endpoint
+                                          {:session  session-id
+                                           :data     true
+                                           :buf-size buf-size}
+                                          net-out')]
+                        (if (:eof hdr)
+                          {:eof :remote}
+                          (recur chunk)))))))))))
+      (finally
+        (try
+          (http/post web-server-endpoint
+                     {:session session-id
+                      :eof     true})
+          (catch Exception _
+            nil))
+        (tls/close-silently plaintext)))))
 
 
 (defn start-plaintext-echo-server! [client-keys-file web-server-endpoint]
@@ -305,4 +355,4 @@
               (println "Timeout waiting for web server to shutdown")))
           #_(run {:remote-url (str "http://127.0.0.1:" web-server-port "/nrepl")}))))
     (catch Exception e
-      (println "Error:" (ex-message e)))))
+      (println "dev Error:" (ex-message e)))))

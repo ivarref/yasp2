@@ -18,8 +18,6 @@
       (.build)))
 
 
-
-
 (defn- pr-str-safe [x]
   (let [v (binding [*print-dup* false
                     *print-meta* false
@@ -44,12 +42,6 @@
 
 (defn- b64-str->bytes [^String s]
   (.decode (Base64/getMimeDecoder) (.getBytes ^String s StandardCharsets/US_ASCII)))
-
-
-(defn- part-str->edn [part-str]
-  (let [bytes (.decode (Base64/getMimeDecoder) (.getBytes ^String part-str StandardCharsets/US_ASCII))
-        str' (String. bytes StandardCharsets/US_ASCII)]
-    (edn/read-string str')))
 
 
 (defn encode
@@ -83,7 +75,9 @@
                 (.build))
         resp (.send ^HttpClient client req (HttpResponse$BodyHandlers/ofString))]
     (if (= 200 (.statusCode resp))
-      (decode-body-string (.body resp))
+      (let [[hdr chunk] (decode-body-string (.body resp))]
+        (println "<<<< Client recv" (alength ^byte/1 chunk) "bytes")
+        [hdr chunk])
       (throw (ex-info "Unexpected HTTP status code" {:code (.statusCode resp)})))))
 
 
@@ -92,4 +86,7 @@
    (post url header (make-array Byte/TYPE 0)))
   ([^String url header payload]
    (assert (map? header))
+   (if (pos-int? (alength ^byte/1 payload))
+     (println ">>>> Client send" (alength ^byte/1 payload) "bytes")
+     (println ">>>> Client send 0 bytes (header only)"))
    (post-text url (encode header payload))))

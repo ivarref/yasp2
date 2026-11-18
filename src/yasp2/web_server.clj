@@ -70,11 +70,12 @@
                                  (if (some? (get-in old-state [:session session-id]))
                                    old-state
                                    (assoc-in old-state [:session session-id]
-                                             (make-connection! proxy-to-port))))))]
-        (let [{:keys [^Socket socket
+                                             (make-connection! proxy-to-port))))))
+            buf-size (get headers :buf-size)]
+        (let [{:keys [^Socket _socket
                       ^BufferedInputStream in
                       ^BufferedOutputStream out]} (get-in new-state [:session session-id])
-              buffer (make-array Byte/TYPE (* 4 65536))
+              buffer (make-array Byte/TYPE buf-size)
               write-exception (atom nil)]
           (try
             (.write out ^byte/1 payload-bytes)
@@ -93,7 +94,7 @@
                 (http/encode {:session session-id
                               :eof     true})
                 (do
-                  (println "<<<< Web server recv" headers (alength payload-bytes))
+                  #_(println "<<<< Web server recv" headers (alength payload-bytes))
                   (http/encode {:session   session-id
                                 :data      true
                                 :available false #_(.available in)}
