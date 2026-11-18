@@ -46,7 +46,7 @@
       (and session-id (get headers :eof))
       (locking state-atom
         (try
-          (println "Web server: Received EOF")
+          #_(println "Web server: Received EOF")
           (let [{:keys [^Socket socket ^BufferedInputStream in out]} (get-in @state-atom [:session session-id])]
             (tls/close-silently out)
             (tls/close-silently in)

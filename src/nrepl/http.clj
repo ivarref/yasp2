@@ -75,9 +75,9 @@
                 (.build))
         resp (.send ^HttpClient client req (HttpResponse$BodyHandlers/ofString))]
     (if (= 200 (.statusCode resp))
-      (let [[hdr chunk] (decode-body-string (.body resp))]
-        (println "<<<< Client recv" (alength ^byte/1 chunk) "bytes")
-        [hdr chunk])
+      (let [[hdr byte-chunk] (decode-body-string (.body resp))]
+        #_(println "<<<< Client recv" (alength ^byte/1 chunk) "bytes")
+        [hdr byte-chunk])
       (throw (ex-info "Unexpected HTTP status code" {:code (.statusCode resp)})))))
 
 
@@ -86,7 +86,7 @@
    (post url header (make-array Byte/TYPE 0)))
   ([^String url header payload]
    (assert (map? header))
-   (if (pos-int? (alength ^byte/1 payload))
-     (println ">>>> Client send" (alength ^byte/1 payload) "bytes")
-     (println ">>>> Client send 0 bytes (header only)"))
+   #_(if (pos-int? (alength ^byte/1 payload))
+       (println ">>>> Client send" (alength ^byte/1 payload) "bytes")
+       (println ">>>> Client send 0 bytes (header only)"))
    (post-text url (encode header payload))))
