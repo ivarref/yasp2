@@ -257,6 +257,7 @@
                 (let [n (read-some plain-in buf)]
                   (if (= n -1)
                     ;; We are done reading from plaintext in
+                    ;; Close the TLS session:
                     (loop [start-ms (System/currentTimeMillis)
                            out (close-outbound! engine net-out)]
                       (let [[hdr chunk] (http/post
