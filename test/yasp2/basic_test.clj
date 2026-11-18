@@ -63,51 +63,55 @@
         {:port (.getLocalPort server)}))))
 
 
-;; Case: Client EOFs
-#_(deftest hello-client-eof
-    (try
-      (let [web-server-state (atom {})
-            result-promise (promise)
-            futures (atom 0)]
-        (with-open [^AutoCloseable tls-server (start-tls-echo-server! futures "server.keys")
-                    ^AutoCloseable web-server (web-server/start-web-server!
-                                                web-server-state (-> tls-server meta :port))
-                    ^ServerSocket plaintext-server (client/start-proxy-server!
-                                                     "client.keys"
-                                                     (str "http://127.0.0.1:"
-                                                          (-> web-server meta :port)
-                                                          "/nrepl")
-                                                     result-promise)]
-          (let [_web-server-port (-> web-server meta :port)
-                plaintext-port (.getLocalPort plaintext-server)]
-            (with-open [^Socket client (Socket. "127.0.0.1" ^int plaintext-port)
-                        in (-> (.getInputStream client)
-                               (InputStreamReader. StandardCharsets/UTF_8)
-                               (BufferedReader.))
-                        out (BufferedOutputStream. (.getOutputStream client))]
-              (.setSoTimeout client 5000)
-              (.write out (.getBytes "Hello ÆØÅ\n" StandardCharsets/UTF_8))
-              (.flush out)
-              (is (= "Hello ÆØÅ" (.readLine in)))
+(defn port-of [x]
+  (let [v (some-> x meta :port)]
+    (assert (pos-int? v))
+    v))
 
-              (.write out (.getBytes "Yolo\n" StandardCharsets/UTF_8))
-              (.flush out)
-              (is (= "Yolo" (.readLine in)))
-              (is (= 1 (count (keys (get @web-server-state :session))))))
-            (let [web-server-shutdown (future
-                                        (while (not (empty? (keys (get @web-server-state :session))))
-                                          (Thread/sleep 10)))]
-              (when (= :timeout (deref web-server-shutdown 10000 :timeout))
-                (println "Timeout waiting for web server to shutdown")))))
-        (while (not= 0 @futures)
-          (Thread/sleep 10))
-        (when (= :timeout (deref result-promise 10000 :timeout))
-          (throw (ex-info "Timeout waiting for result-promise" {})))
-        (is (= {:eof :client}
-               @result-promise)))
-      (catch Exception e
-        (println "Error:" (ex-message e))
-        (throw e))))
+
+;; Case: Client EOFs
+(deftest hello-client-eof
+  (try
+    (let [web-server-state (atom {})
+          result-promise (promise)
+          futures (atom 0)]
+      (with-open [^AutoCloseable tls-server (start-tls-echo-server! futures "server.keys")
+                  ^AutoCloseable web-server (web-server/start-web-server!
+                                              web-server-state (port-of tls-server))
+                  ^AutoCloseable plaintext-server (client/start-proxy-server!
+                                                    "client.keys"
+                                                    (str "http://127.0.0.1:"
+                                                         (port-of web-server)
+                                                         "/nrepl")
+                                                    result-promise)]
+        (with-open [^Socket client (Socket. "127.0.0.1" ^int (port-of plaintext-server))
+                    in (-> (.getInputStream client)
+                           (InputStreamReader. StandardCharsets/UTF_8)
+                           (BufferedReader.))
+                    out (BufferedOutputStream. (.getOutputStream client))]
+          (.setSoTimeout client 5000)
+          (.write out (.getBytes "Hello ÆØÅ\n" StandardCharsets/UTF_8))
+          (.flush out)
+          (is (= "Hello ÆØÅ" (.readLine in)))
+
+          (.write out (.getBytes "Yolo\n" StandardCharsets/UTF_8))
+          (.flush out)
+          (is (= "Yolo" (.readLine in)))
+          (is (= 1 (count (keys (get @web-server-state :session))))))
+        (let [web-server-shutdown (future
+                                    (while (not (empty? (keys (get @web-server-state :session))))
+                                      (Thread/sleep 10)))]
+          (when (= :timeout (deref web-server-shutdown 10000 :timeout))
+            (println "Timeout waiting for web server to shutdown"))))
+      (while (not= 0 @futures)
+        (Thread/sleep 10))
+      (when (= :timeout (deref result-promise 10000 :timeout))
+        (throw (ex-info "Timeout waiting for result-promise" {})))
+      (is (= {:eof :client}
+             @result-promise)))
+    (catch Exception e
+      (println "Error:" (ex-message e))
+      (throw e))))
 
 
 (defn uppercase-loop! [^Socket s]
