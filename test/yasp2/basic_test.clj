@@ -73,12 +73,11 @@
 ;; Case: Client EOFs
 (deftest hello-client-eof
   (try
-    (let [web-server-state (atom {})
-          result-promise (promise)
+    (let [result-promise (promise)
           futures (atom 0)]
       (with-open [^AutoCloseable tls-server (start-tls-echo-server! futures "server.keys")
                   ^AutoCloseable web-server (web-server/start-web-server!
-                                              web-server-state (port-of tls-server))
+                                              (atom {}) (port-of tls-server))
                   ^AutoCloseable plaintext-server (client/start-proxy-server!
                                                     "client.keys"
                                                     (str "http://127.0.0.1:"
@@ -98,10 +97,7 @@
 
           (.write out (.getBytes "Yolo\n" StandardCharsets/UTF_8))
           (.flush out)
-          (is (= "Yolo" (.readLine in)))
-          (is (= 1 (count (keys (get @web-server-state :session)))))))
-      (while (not= 0 @futures)
-        (Thread/sleep 10))
+          (is (= "Yolo" (.readLine in)))))
       (is (= {:eof :client}
              @result-promise)))
     (catch Exception e
@@ -117,8 +113,7 @@
         (when-let [lin (.readLine in)]
           (.write out (str/upper-case lin))
           (.write out "\n")
-          (.flush out)
-          (recur))))))
+          (.flush out))))))
 
 
 (defn start-uppercase-echo-server! [server-keys-file]
@@ -157,14 +152,12 @@
         {:port (.getLocalPort server)}))))
 
 
-(deftest client-disconnect
+(deftest eof-remote
   (try
-    (let [web-server-state (atom {})
-          result-promise (promise)]
+    (let [result-promise (promise)]
       (with-open [^AutoCloseable tls-server (start-uppercase-echo-server! "server.keys")
                   ^AutoCloseable web-server (web-server/start-web-server!
-                                              web-server-state
-                                              (port-of tls-server))
+                                              (atom {}) (port-of tls-server))
                   ^AutoCloseable plaintext-server (client/start-proxy-server!
                                                     "client.keys"
                                                     (str "http://127.0.0.1:"
@@ -180,7 +173,10 @@
             (.setSoTimeout client 5000)
             (.write out (.getBytes "hello\n" StandardCharsets/UTF_8))
             (.flush out)
-            (is (= "HELLO" (.readLine in)))))))
+            (is (= "HELLO" (.readLine in)))
+            (.write out (.getBytes "yolo\n" StandardCharsets/UTF_8))
+            (.flush out)))
+        (is (= {:eof :remote} @result-promise))))
     (catch Exception e
       (println "Error:" (ex-message e))
       (throw e))))

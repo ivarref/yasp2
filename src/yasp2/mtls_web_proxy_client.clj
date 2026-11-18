@@ -351,7 +351,7 @@
               (loop []
                 (let [spent-ms (- (System/currentTimeMillis) start-ms)]
                   (when (> spent-ms 10000)
-                    (throw (ex-info "Timeout waiting for proxy server to close" {})))
+                    (throw (ex-info "Timeout waiting for proxy connection threads to finish" {})))
                   (when (not= @active-conns 0)
                     (Thread/sleep 10)
                     (recur)))))
