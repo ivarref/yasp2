@@ -78,13 +78,13 @@
           resp (.send ^HttpClient client req (HttpResponse$BodyHandlers/ofString))]
       (if (= 200 (.statusCode resp))
         (let [[hdr byte-chunk] (decode-body-string (.body resp))]
-          #_(println "<<<< Client recv" (alength ^byte/1 chunk) "bytes")
           [hdr byte-chunk])
-        (throw (ex-info "Unexpected HTTP status code" {:code (.statusCode resp)}))))
-    (catch HttpTimeoutException _hte
-      [{:eof :http} (byte-array 0)])
-    (catch IOException _ioe
-      [{:eof :http} (byte-array 0)])))
+        [(with-meta {:eof :http} {:status-code (.statusCode resp)}) (byte-array 0)]
+        #_(throw (ex-info "Unexpected HTTP status code" {:code (.statusCode resp)}))))
+    (catch HttpTimeoutException hte
+      [(with-meta {:eof :http} {:ex hte}) (byte-array 0)])
+    (catch IOException ioe
+      [(with-meta {:eof :http} {:ex ioe}) (byte-array 0)])))
 
 
 (defn post

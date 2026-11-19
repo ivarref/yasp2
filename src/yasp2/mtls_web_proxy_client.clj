@@ -266,7 +266,7 @@
                                         :buf-size buf-size}
                                        net-out')]
                 (if (:eof hdr)
-                  {:eof (:eof hdr)}
+                  hdr
                   (recur byte-chunk))))))))))
 
 

@@ -137,7 +137,16 @@
     post-request?
     (reify HttpHandler
       (^void handle [_ ^HttpExchange ex]
-        (post-handler state-atom proxy-to-port ex)))
+        (locking state-atom
+          (swap! state-atom (fn [old-state]
+                              (update old-state :running-threads (fnil conj #{}) (Thread/currentThread)))))
+        (try
+          (post-handler state-atom proxy-to-port ex)
+          (finally
+            (locking state-atom
+              (swap! state-atom (fn [old-state]
+                                  (update old-state :running-threads (fnil disj #{})
+                                          (Thread/currentThread)))))))))
     fallback-handler))
 
 
@@ -149,14 +158,19 @@
       (reify AutoCloseable
         (close [_]
           (println "web-server: Begin shutdown")
-          (let [stop-server-job (future (.stop server 10))]
+          (doseq [{:keys [socket in out]} (vals (get @state-atom :session))]
+            (println "Force closing connection ...")
+            (tls/close-silently in)
+            (tls/close-silently out)
+            (tls/close-silently socket))
+          (let [stop-server-job (future (.stop server 3))]
             (when (= :timeout (deref stop-server-job 5000 :timeout))
               (binding [*out* *err*]
                 (println "Warning: Timeout waiting for web server to stop"))))
-          (let [web-server-shutdown (future
-                                      (while (not (empty? (keys (get @state-atom :session))))
-                                        (Thread/sleep 10)))]
-            (when (= :timeout (deref web-server-shutdown 5000 :timeout))
-              (binding [*out* *err*]
-                (println "Warning: Timeout waiting for web sessions to exit"))))))
+          #_(let [web-server-shutdown (future
+                                        (while (not (empty? (keys (get @state-atom :session))))
+                                          (Thread/sleep 10)))]
+              (when (= :timeout (deref web-server-shutdown 5000 :timeout))
+                (binding [*out* *err*]
+                  (println "Warning: Timeout waiting for web sessions to exit"))))))
       {:port (.getPort (.getAddress server))})))

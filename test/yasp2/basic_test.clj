@@ -207,9 +207,17 @@
 
 
 ;; Case:
-;; Client sends and receives lots of data. Keeps the pump going fast for some time.
-;; Server only writes data, so HTTP server writing to destination (TCP server) will become blocked.
-;; => HTTP POST on client side times out
+;; Client sends and receives lots of data. Keeps the pump going for some time.
+;; TCP server only writes data, never read anything.
+;; This causes HTTP server, which writes to the TCP server, to eventually become blocked.
+;;
+;; Which in turn results in that HTTP POST on client proxy side times out.
+;; The client proxy then closes the connection.
+;; Causing the client (TCP) connection to throw on read/write
+;;
+;; The result on the proxy is {:eof :http}
+;;
+;; Phew!
 (deftest ^:focus buffer-full->http-timeout
   (try
     (let [result-promise (promise)
@@ -227,8 +235,10 @@
                                                       (write "yolo")
                                                       (swap! sent-lines inc)
                                                       (recur)))
-                                                  (catch Exception e
-                                                    (.printStackTrace e)))))
+                                                  (catch Exception _e
+                                                    ;; Connection/socket closed when shutting down
+                                                    ;; web server
+                                                    nil))))
                   ^AutoCloseable web-server (web-server/start-web-server!
                                               web-state (port-of tls-server))
                   ^AutoCloseable plaintext-server (client/start-proxy-server!
@@ -243,22 +253,23 @@
         (try
           (let [read-line (sock->line-reader client)
                 write (sock->line-writer client)]
-            (dotimes [x 100000]
+            (while true
               (write "hello")
               (read-line)
               (swap! recv-lines inc)))
-          (catch Exception e ;; Sometimes it throws, sometimes not?!
-            (.printStackTrace e))
+          (catch Exception _e
+            ;; The proxy has closed the connection while we were using it.
+            ;; The cause: timeout for POST-ing
+            nil)
           (finally
             (println "client: done"))))
-
-      (println "everything done!" @web-state)
-      (println "result-promise" @result-promise)
-      ;(println "sent-lines" @sent-lines)
-      ;(println "recv-lines" @recv-lines)
+      #_(println "everything done!" @web-state)
+      ;(println "result" @result-promise)
+      ;(println "result meta" (meta @result-promise))
+      (is (= {:eof :http} @result-promise))
       (let [spent-ms (- (System/currentTimeMillis)
                         start-ms)]
-        (println "done in:" spent-ms)))
+        (println "done in:" spent-ms "ms")))
     (catch Exception e
       (println "buffer-full->http-timeout error:" (ex-message e))
       (throw e))))
