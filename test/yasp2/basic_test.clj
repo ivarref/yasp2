@@ -7,6 +7,7 @@
   (:import (java.io BufferedInputStream BufferedOutputStream BufferedReader
                     BufferedWriter InputStream InputStreamReader OutputStream OutputStreamWriter)
            (java.lang AutoCloseable)
+           (java.lang.management ManagementFactory)
            (java.net ServerSocket Socket SocketException)
            (java.nio.charset StandardCharsets)
            (javax.net.ssl SSLServerSocket)))
@@ -213,11 +214,11 @@
           web-state (atom {})
           sent-lines (atom 0)
           recv-lines (atom 0)]
+      (println "self pid is:" (.getPid (ManagementFactory/getRuntimeMXBean)))
       (with-open [^AutoCloseable tls-server (start-tls-server!
                                               "server.keys"
                                               (fn [sock]
-                                                (let [read-line (sock->line-reader sock)
-                                                      write (sock->line-writer sock)]
+                                                (let [write (sock->line-writer sock)]
                                                   (loop []
                                                     (write "yolo")
                                                     (swap! sent-lines inc)
@@ -239,9 +240,11 @@
               (write "hello")
               (read-line)
               (swap! recv-lines inc)))))
+
       (println "everything done!" @web-state)
-      (println "sent-lines" @sent-lines)
-      (println "recv-lines" @recv-lines)
+      (println "result-promise" @result-promise)
+      ;(println "sent-lines" @sent-lines)
+      ;(println "recv-lines" @recv-lines)
       (let [spent-ms (- (System/currentTimeMillis)
                         start-ms)]
         (println "done in:" spent-ms)))
