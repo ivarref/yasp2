@@ -357,17 +357,21 @@
     (with-meta
       (reify AutoCloseable
         (close [_]
-          (tls/close-silently server)
-          (when drain-on-close?
-            (let [start-ms (System/currentTimeMillis)]
-              (loop []
-                (let [spent-ms (- (System/currentTimeMillis) start-ms)]
-                  (when (> spent-ms 10000)
-                    (throw (ex-info "Timeout waiting for proxy connection threads to finish" {})))
-                  (when (not= @active-conns 0)
-                    (Thread/sleep 10)
-                    (recur)))))
-            (when (= :timeout (deref result-promise 10000 :timeout))
-              (throw (ex-info "Timeout waiting for result-promise" {}))))))
+          (try
+            (println "client-proxy: Begin shutdown")
+            (tls/close-silently server)
+            (when drain-on-close?
+              (let [start-ms (System/currentTimeMillis)]
+                (loop []
+                  (let [spent-ms (- (System/currentTimeMillis) start-ms)]
+                    (when (> spent-ms 10000)
+                      (throw (ex-info "Timeout waiting for proxy connection threads to finish" {})))
+                    (when (not= @active-conns 0)
+                      (Thread/sleep 10)
+                      (recur)))))
+              (when (= :timeout (deref result-promise 10000 :timeout))
+                (throw (ex-info "Timeout waiting for result-promise" {}))))
+            (finally
+              (println "client-proxy: Done shutdown")))))
       {:port (.getLocalPort server)})))
 

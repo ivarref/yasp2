@@ -144,10 +144,11 @@
 (defn start-web-server! [state-atom proxy-to-port]
   (let [server (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)]
     (.createContext server "/nrepl" ^HttpHandler (create-handler state-atom proxy-to-port))
-    (.start server)
+    (future (.start server))
     (with-meta
       (reify AutoCloseable
         (close [_]
+          (println "web-server: Begin shutdown")
           (let [stop-server-job (future (.stop server 10))]
             (when (= :timeout (deref stop-server-job 5000 :timeout))
               (binding [*out* *err*]

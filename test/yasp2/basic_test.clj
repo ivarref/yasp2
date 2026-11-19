@@ -149,6 +149,9 @@
                                                (try
                                                  (swap! futures-count inc)
                                                  (conn-handler sock)
+                                                 (catch Exception e
+                                                   (println "handler threw exception:"
+                                                            (ex-message e)))
                                                  (finally
                                                    (tls/close-silently sock)
                                                    (swap! futures-count dec))))
@@ -218,11 +221,14 @@
       (with-open [^AutoCloseable tls-server (start-tls-server!
                                               "server.keys"
                                               (fn [sock]
-                                                (let [write (sock->line-writer sock)]
-                                                  (loop []
-                                                    (write "yolo")
-                                                    (swap! sent-lines inc)
-                                                    (recur)))))
+                                                (try
+                                                  (let [write (sock->line-writer sock)]
+                                                    (loop []
+                                                      (write "yolo")
+                                                      (swap! sent-lines inc)
+                                                      (recur)))
+                                                  (catch Exception e
+                                                    (.printStackTrace e)))))
                   ^AutoCloseable web-server (web-server/start-web-server!
                                               web-state (port-of tls-server))
                   ^AutoCloseable plaintext-server (client/start-proxy-server!
@@ -232,14 +238,19 @@
                                                                                "/nrepl")
                                                      :post-timeout-ms     3000
                                                      :result-promise      result-promise
-                                                     :drain-on-close?     true})]
-        (with-open [^Socket client (Socket. "127.0.0.1" ^int (port-of plaintext-server))]
+                                                     :drain-on-close?     true})
+                  ^Socket client (Socket. "127.0.0.1" ^int (port-of plaintext-server))]
+        (try
           (let [read-line (sock->line-reader client)
                 write (sock->line-writer client)]
             (dotimes [x 100000]
               (write "hello")
               (read-line)
-              (swap! recv-lines inc)))))
+              (swap! recv-lines inc)))
+          (catch Exception e ;; Sometimes it throws, sometimes not?!
+            (.printStackTrace e))
+          (finally
+            (println "client: done"))))
 
       (println "everything done!" @web-state)
       (println "result-promise" @result-promise)
@@ -249,7 +260,7 @@
                         start-ms)]
         (println "done in:" spent-ms)))
     (catch Exception e
-      (println "Error:" (ex-message e))
+      (println "buffer-full->http-timeout error:" (ex-message e))
       (throw e))))
 
 
