@@ -140,7 +140,8 @@
 
 (defn handshake! [^String session-id
                   buf-size
-                  ^SSLEngine engine ^String web-server-endpoint
+                  ^SSLEngine engine
+                  opts
                   ^ByteBuffer net-in ^ByteBuffer net-out
                   ^ByteBuffer app-in]
   (.beginHandshake engine)
@@ -158,7 +159,7 @@
                     hdr {:session  session-id
                          :data     true
                          :buf-size buf-size}
-                    [hdr-remote byte-chunk] (http/post web-server-endpoint
+                    [hdr-remote byte-chunk] (http/post opts
                                                        hdr
                                                        out-bytes)]
                 (when (:eof hdr-remote)
@@ -221,16 +222,12 @@
 
 
 (defn data-loop! [^String session-id
-                  ^String web-server-endpoint
+                  opts
                   ^SSLEngine engine
-                  ^BufferedInputStream plain-in
-                  ^BufferedOutputStream plain-out
-                  ^ByteBuffer app-in
-                  ^ByteBuffer app-out
-                  ^ByteBuffer net-in
-                  ^ByteBuffer net-out
-                  ^byte/1 buf
-                  buf-size]
+                  ^BufferedInputStream plain-in ^BufferedOutputStream plain-out
+                  ^ByteBuffer app-in ^ByteBuffer app-out
+                  ^ByteBuffer net-in ^ByteBuffer net-out
+                  ^byte/1 buf buf-size]
   (loop [remote-chunk (make-array Byte/TYPE 0)]
     ;; On initial loop: copy whatever might be in net-in to app-in
     ;; Regular loop: copy net-in + remote-chunk to app-in
@@ -252,7 +249,7 @@
             ;; We are done reading from plaintext in
             ;; Close the TLS session:
             (close-tls-session! session-id
-                                web-server-endpoint
+                                opts
                                 engine
                                 plain-out
                                 app-in
@@ -263,13 +260,13 @@
               (wraps! engine app-out net-out (^[byte/1 int] Arrays/copyOf buf (int n)))
               (let [net-out' (bytebuffer-drain-to-byte-array net-out)
                     [hdr byte-chunk] (http/post
-                                       web-server-endpoint
+                                       opts
                                        {:session  session-id
                                         :data     true
                                         :buf-size buf-size}
                                        net-out')]
                 (if (:eof hdr)
-                  {:eof :remote}
+                  {:eof (:eof hdr)}
                   (recur byte-chunk))))))))))
 
 
@@ -278,8 +275,8 @@
 ;; https://docs.oracle.com/javase/8/docs/api/javax/net/ssl/SSLEngine.html
 ;; https://docs.oracle.com/javase/8/docs/api/javax/net/ssl/SSLEngineResult.HandshakeStatus.html
 ;; https://docs.oracle.com/javase/8/docs/api/java/nio/ByteBuffer.html
-;; And plenty of help from Claude Code as well
-(defn run-conn-proxy! [^SSLContext tls-context web-server-endpoint ^Socket plaintext]
+;; And plenty of help from Claude Code Opus 5.5 as well
+(defn run-conn-proxy! [opts ^SSLContext tls-context ^Socket plaintext]
   (let [session-id (str (random-uuid))]
     (try
       (let [^SSLEngine engine (.createSSLEngine tls-context)
@@ -293,13 +290,13 @@
             net-in (ByteBuffer/allocate buffer-max)
             net-out (ByteBuffer/allocate buffer-max)]
         ;; Do the TLS handshake first
-        (handshake! session-id buf-size engine web-server-endpoint net-in net-out app-in)
+        (handshake! session-id buf-size engine opts net-in net-out app-in)
         (.setSoTimeout plaintext 1000)
         (let [plain-in (BufferedInputStream. (.getInputStream plaintext))
               plain-out (BufferedOutputStream. (.getOutputStream plaintext))
               buf (byte-array (int buf-size))]
           (data-loop! session-id
-                      web-server-endpoint
+                      opts
                       engine
                       plain-in
                       plain-out
@@ -311,7 +308,7 @@
                       buf-size)))
       (finally
         (try
-          (http/post web-server-endpoint
+          (http/post opts
                      {:session session-id
                       :eof     true})
           (catch Exception _
@@ -319,8 +316,23 @@
         (tls/close-silently plaintext)))))
 
 
-(defn start-proxy-server! [client-keys-file web-server-endpoint result-promise drain-on-close?]
-  (let [tls-context (tls/ssl-str-context (slurp client-keys-file))
+(defn adapted-opts [{:keys [client-keys-file web-server-endpoint
+                            drain-on-close?
+                            result-promise
+                            post-timeout-ms]}]
+  (assert (pos-int? post-timeout-ms))
+  (assoc {}
+    :client-keys-file client-keys-file
+    :web-server-endpoint web-server-endpoint
+    :drain-on-close? (or drain-on-close? false)
+    :result-promise (or result-promise nil)
+    :post-timeout-ms (or post-timeout-ms 60000)))
+
+
+(defn start-proxy-server! [opts]
+  (let [opts' (adapted-opts opts)
+        {:keys [client-keys-file result-promise drain-on-close?]} opts'
+        tls-context (tls/ssl-str-context (slurp client-keys-file))
         server (ServerSocket.)
         active-conns (atom 0)]
     (.bind server (InetSocketAddress. "127.0.0.1" 0))
@@ -330,7 +342,7 @@
           (future
             (try
               (swap! active-conns inc)
-              (let [res (run-conn-proxy! tls-context web-server-endpoint sock)]
+              (let [res (run-conn-proxy! opts' tls-context sock)]
                 (when result-promise
                   (deliver result-promise res)))
               (catch Exception e

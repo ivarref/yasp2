@@ -108,6 +108,10 @@
 
 (defn post-handler
   [state-atom proxy-to-port ^HttpExchange ex]
+  (locking state-atom
+    (swap! state-atom
+           (fn [old-state]
+             (update old-state :request-count (fn [x] (inc (or x 0)))))))
   (let [encoded-response (try
                            (with-open [input-stream (.getRequestBody ex)
                                        baos (ByteArrayOutputStream.)]

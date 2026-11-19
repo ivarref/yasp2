@@ -12,6 +12,24 @@
            (javax.net.ssl SSLServerSocket)))
 
 
+(defn sock->line-writer [^Socket sock]
+  (let [out (OutputStreamWriter.
+              (BufferedOutputStream. (.getOutputStream sock))
+              StandardCharsets/UTF_8)]
+    (fn [^String lin]
+      (.write out lin)
+      (.write out "\n")
+      (.flush out))))
+
+
+(defn sock->line-reader [^Socket sock]
+  (let [in (-> (.getInputStream sock)
+               (InputStreamReader. StandardCharsets/UTF_8)
+               (BufferedReader.))]
+    (fn []
+      (.readLine in))))
+
+
 (defn- do-copy [^InputStream input ^OutputStream output]
   (let [buffer (make-array Byte/TYPE 65536)]
     (loop []
@@ -79,12 +97,13 @@
                   ^AutoCloseable web-server (web-server/start-web-server!
                                               (atom {}) (port-of tls-server))
                   ^AutoCloseable plaintext-server (client/start-proxy-server!
-                                                    "client.keys"
-                                                    (str "http://127.0.0.1:"
-                                                         (port-of web-server)
-                                                         "/nrepl")
-                                                    result-promise
-                                                    true)]
+                                                    {:client-keys-file    "client.keys"
+                                                     :web-server-endpoint (str "http://127.0.0.1:"
+                                                                               (port-of web-server)
+                                                                               "/nrepl")
+                                                     :post-timeout-ms     3000
+                                                     :result-promise      result-promise
+                                                     :drain-on-close?     true})]
         (with-open [^Socket client (Socket. "127.0.0.1" ^int (port-of plaintext-server))
                     in (-> (.getInputStream client)
                            (InputStreamReader. StandardCharsets/UTF_8)
@@ -159,12 +178,13 @@
                   ^AutoCloseable web-server (web-server/start-web-server!
                                               (atom {}) (port-of tls-server))
                   ^AutoCloseable plaintext-server (client/start-proxy-server!
-                                                    "client.keys"
-                                                    (str "http://127.0.0.1:"
-                                                         (port-of web-server)
-                                                         "/nrepl")
-                                                    result-promise
-                                                    true)]
+                                                    {:client-keys-file    "client.keys"
+                                                     :web-server-endpoint (str "http://127.0.0.1:"
+                                                                               (port-of web-server)
+                                                                               "/nrepl")
+                                                     :post-timeout-ms     3000
+                                                     :result-promise      result-promise
+                                                     :drain-on-close?     true})]
         (with-open [^Socket client (Socket. "127.0.0.1" ^int (port-of plaintext-server))]
           (let [in (-> (.getInputStream client)
                        (InputStreamReader. StandardCharsets/UTF_8)
@@ -182,35 +202,88 @@
       (throw e))))
 
 
-(deftest client-disconnected
+;; Case:
+;; Client sends and receives lots of data. Keeps the pump going fast for some time.
+;; Server only writes data, so HTTP server writing to destination (TCP server) will become blocked.
+;; => HTTP POST on client side times out
+(deftest ^:focus buffer-full->http-timeout
   (try
-    (let [result-promise (promise)]
+    (let [result-promise (promise)
+          start-ms (System/currentTimeMillis)
+          web-state (atom {})
+          sent-lines (atom 0)
+          recv-lines (atom 0)]
       (with-open [^AutoCloseable tls-server (start-tls-server!
                                               "server.keys"
                                               (fn [sock]
-                                                (let [out (BufferedOutputStream. (.getOutputStream sock))]
+                                                (let [read-line (sock->line-reader sock)
+                                                      write (sock->line-writer sock)]
                                                   (loop []
-                                                    (.write out (.getBytes "hello\n" StandardCharsets/UTF_8))
-                                                    (.flush out)
+                                                    (write "yolo")
+                                                    (swap! sent-lines inc)
                                                     (recur)))))
                   ^AutoCloseable web-server (web-server/start-web-server!
-                                              (atom {}) (port-of tls-server))
+                                              web-state (port-of tls-server))
                   ^AutoCloseable plaintext-server (client/start-proxy-server!
-                                                    "client.keys"
-                                                    (str "http://127.0.0.1:"
-                                                         (port-of web-server)
-                                                         "/nrepl")
-                                                    result-promise
-                                                    true)]
+                                                    {:client-keys-file    "client.keys"
+                                                     :web-server-endpoint (str "http://127.0.0.1:"
+                                                                               (port-of web-server)
+                                                                               "/nrepl")
+                                                     :post-timeout-ms     3000
+                                                     :result-promise      result-promise
+                                                     :drain-on-close?     true})]
         (with-open [^Socket client (Socket. "127.0.0.1" ^int (port-of plaintext-server))]
-          (let [in (-> (.getInputStream client)
-                       (InputStreamReader. StandardCharsets/UTF_8)
-                       (BufferedReader.))
-                out (BufferedOutputStream. (.getOutputStream client))]
-            (.setSoTimeout client 5000)
-            (.close in)
-            #_(Thread/sleep 1000)))
-        (is (= {:eof :client-disconnected} @result-promise))))
+          (let [read-line (sock->line-reader client)
+                write (sock->line-writer client)]
+            (dotimes [x 100000]
+              (write "hello")
+              (read-line)
+              (swap! recv-lines inc)))))
+      (println "everything done!" @web-state)
+      (println "sent-lines" @sent-lines)
+      (println "recv-lines" @recv-lines)
+      (let [spent-ms (- (System/currentTimeMillis)
+                        start-ms)]
+        (println "done in:" spent-ms)))
     (catch Exception e
       (println "Error:" (ex-message e))
       (throw e))))
+
+
+;; Trigger client-disconnected state by
+;; 1. Filling the buffer to client-in in the proxy
+;; 2. Wait for the proxy to block on write
+;; 3. Disconnect client
+#_(deftest ^:focus client-disconnected
+    (try
+      (let [result-promise (promise)]
+        (with-open [^AutoCloseable tls-server (start-tls-server!
+                                                "server.keys"
+                                                (fn [sock]
+                                                  (let [out (BufferedOutputStream. (.getOutputStream sock))]
+                                                    (loop [line 1]
+                                                      (.write out (.getBytes "hello\n" StandardCharsets/UTF_8))
+                                                      (.flush out)
+                                                      (println "wrote line" line)
+                                                      (recur (inc line))))))
+                    ^AutoCloseable web-server (web-server/start-web-server!
+                                                (atom {}) (port-of tls-server))
+                    ^AutoCloseable plaintext-server (client/start-proxy-server!
+                                                      "client.keys"
+                                                      (str "http://127.0.0.1:"
+                                                           (port-of web-server)
+                                                           "/nrepl")
+                                                      result-promise
+                                                      true)]
+          (with-open [^Socket client (Socket. "127.0.0.1" ^int (port-of plaintext-server))]
+            (let [in (-> (.getInputStream client)
+                         (InputStreamReader. StandardCharsets/UTF_8)
+                         (BufferedReader.))
+                  out (BufferedOutputStream. (.getOutputStream client))]
+              (.setSoTimeout client 5000)
+              (Thread/sleep 5000)
+              #_(Thread/sleep 1000)))
+          (is (= {:eof :client-disconnected} @result-promise))))
+      (catch Exception e
+        (println "Error:" (ex-message e))
+        (throw e))))

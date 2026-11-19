@@ -3,3 +3,4 @@
 *.iml
 *.keys
 .cpcache/
+.clj-kondo/.cache/

@@ -1,9 +1,10 @@
 (ns nrepl.http
   (:require [clojure.edn :as edn]
             [clojure.string :as str])
-  (:import (java.net URI)
+  (:import (java.io IOException)
+           (java.net URI)
            (java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
-                          HttpResponse$BodyHandlers)
+                          HttpResponse$BodyHandlers HttpTimeoutException)
            (java.nio.charset Charset StandardCharsets)
            (java.time Duration)
            (java.util Base64)))
@@ -67,26 +68,31 @@
       (throw (ex-info "Unexpected body format" {:body body-str})))))
 
 
-(defn- post-text [^String url ^String body]
-  (let [req (-> (HttpRequest/newBuilder (URI/create url))
-                (.timeout (Duration/ofSeconds 60))
-                (.header "Content-Type" "text/plain; charset=utf-8")
-                (.POST (HttpRequest$BodyPublishers/ofString body StandardCharsets/UTF_8))
-                (.build))
-        resp (.send ^HttpClient client req (HttpResponse$BodyHandlers/ofString))]
-    (if (= 200 (.statusCode resp))
-      (let [[hdr byte-chunk] (decode-body-string (.body resp))]
-        #_(println "<<<< Client recv" (alength ^byte/1 chunk) "bytes")
-        [hdr byte-chunk])
-      (throw (ex-info "Unexpected HTTP status code" {:code (.statusCode resp)})))))
+(defn- post-text [{:keys [web-server-endpoint post-timeout-ms] :as opts} ^String body]
+  (try
+    (let [req (-> (HttpRequest/newBuilder (URI/create web-server-endpoint))
+                  (.timeout (Duration/ofMillis post-timeout-ms))
+                  (.header "Content-Type" "text/plain; charset=utf-8")
+                  (.POST (HttpRequest$BodyPublishers/ofString body StandardCharsets/UTF_8))
+                  (.build))
+          resp (.send ^HttpClient client req (HttpResponse$BodyHandlers/ofString))]
+      (if (= 200 (.statusCode resp))
+        (let [[hdr byte-chunk] (decode-body-string (.body resp))]
+          #_(println "<<<< Client recv" (alength ^byte/1 chunk) "bytes")
+          [hdr byte-chunk])
+        (throw (ex-info "Unexpected HTTP status code" {:code (.statusCode resp)}))))
+    (catch HttpTimeoutException _hte
+      [{:eof :http} (byte-array 0)])
+    (catch IOException _ioe
+      [{:eof :http} (byte-array 0)])))
 
 
 (defn post
-  ([^String url header]
-   (post url header (make-array Byte/TYPE 0)))
-  ([^String url header payload]
+  ([cfg header]
+   (post cfg header (make-array Byte/TYPE 0)))
+  ([cfg header payload]
    (assert (map? header))
    #_(if (pos-int? (alength ^byte/1 payload))
        (println ">>>> Client send" (alength ^byte/1 payload) "bytes")
        (println ">>>> Client send 0 bytes (header only)"))
-   (post-text url (encode header payload))))
+   (post-text cfg (encode header payload))))
