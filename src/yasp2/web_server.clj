@@ -148,10 +148,14 @@
     (with-meta
       (reify AutoCloseable
         (close [_]
-          (.stop server 0)
+          (let [stop-server-job (future (.stop server 10))]
+            (when (= :timeout (deref stop-server-job 5000 :timeout))
+              (binding [*out* *err*]
+                (println "Warning: Timeout waiting for web server to stop"))))
           (let [web-server-shutdown (future
                                       (while (not (empty? (keys (get @state-atom :session))))
                                         (Thread/sleep 10)))]
-            (when (= :timeout (deref web-server-shutdown 10000 :timeout))
-              (throw (ex-info "Timeout waiting for web server to shutdown" {}))))))
+            (when (= :timeout (deref web-server-shutdown 5000 :timeout))
+              (binding [*out* *err*]
+                (println "Warning: Timeout waiting for web sessions to exit"))))))
       {:port (.getPort (.getAddress server))})))
