@@ -135,7 +135,10 @@
         (.flush out)))))
 
 
-(defn start-tls-server! [server-keys-file conn-handler]
+(defn start-tls-server!
+  "A simple TLS server for development purposes.
+  Calls conn-handler on new connections in a background thread."
+  [server-keys-file conn-handler]
   (let [server-ctx (tls/ssl-str-context (slurp server-keys-file))
         futures-count (atom 0)]
     (let [^SSLServerSocket server (tls/server-socket server-ctx "127.0.0.1" 0)
@@ -145,12 +148,14 @@
                           (loop []
                             (let [recur? (try
                                            (let [sock (.accept ^ServerSocket server)]
+                                             (.setKeepAlive sock true)
                                              (future
                                                (try
                                                  (swap! futures-count inc)
                                                  (conn-handler sock)
                                                  (catch Exception e
-                                                   (println "handler threw exception:"
+                                                   (.printStackTrace e)
+                                                   (println "Conn-handler threw exception:"
                                                             (ex-message e)))
                                                  (finally
                                                    (tls/close-silently sock)
@@ -218,14 +223,13 @@
 ;; The result on the proxy is {:eof :http}
 ;;
 ;; Phew!
-(deftest ^:focus buffer-full->http-timeout
+
+(deftest buffer-full->http-timeout
   (try
     (let [result-promise (promise)
-          start-ms (System/currentTimeMillis)
           web-state (atom {})
-          sent-lines (atom 0)
-          recv-lines (atom 0)]
-      (println "self pid is:" (.getPid (ManagementFactory/getRuntimeMXBean)))
+          exception-count (atom 0)]
+      #_(println "self pid is:" (.getPid (ManagementFactory/getRuntimeMXBean)))
       (with-open [^AutoCloseable tls-server (start-tls-server!
                                               "server.keys"
                                               (fn [sock]
@@ -233,11 +237,11 @@
                                                   (let [write (sock->line-writer sock)]
                                                     (loop []
                                                       (write "yolo")
-                                                      (swap! sent-lines inc)
                                                       (recur)))
                                                   (catch Exception _e
                                                     ;; Connection/socket closed when shutting down
                                                     ;; web server
+                                                    (swap! exception-count inc)
                                                     nil))))
                   ^AutoCloseable web-server (web-server/start-web-server!
                                               web-state (port-of tls-server))
@@ -255,21 +259,14 @@
                 write (sock->line-writer client)]
             (while true
               (write "hello")
-              (read-line)
-              (swap! recv-lines inc)))
+              (read-line)))
           (catch Exception _e
             ;; The proxy has closed the connection while we were using it.
             ;; The cause: timeout for POST-ing
-            nil)
-          (finally
-            (println "client: done"))))
-      #_(println "everything done!" @web-state)
-      ;(println "result" @result-promise)
-      ;(println "result meta" (meta @result-promise))
-      (is (= {:eof :http} @result-promise))
-      (let [spent-ms (- (System/currentTimeMillis)
-                        start-ms)]
-        (println "done in:" spent-ms "ms")))
+            (swap! exception-count inc)
+            nil)))
+      (is (= 2 @exception-count))
+      (is (= {:eof :http-timeout} @result-promise)))
     (catch Exception e
       (println "buffer-full->http-timeout error:" (ex-message e))
       (throw e))))

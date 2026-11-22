@@ -82,9 +82,9 @@
         [(with-meta {:eof :http} {:status-code (.statusCode resp)}) (byte-array 0)]
         #_(throw (ex-info "Unexpected HTTP status code" {:code (.statusCode resp)}))))
     (catch HttpTimeoutException hte
-      [(with-meta {:eof :http} {:ex hte}) (byte-array 0)])
+      [(with-meta {:eof :http-timeout} {:ex hte}) (byte-array 0)])
     (catch IOException ioe
-      [(with-meta {:eof :http} {:ex ioe}) (byte-array 0)])))
+      [(with-meta {:eof :http-error} {:ex ioe}) (byte-array 0)])))
 
 
 (defn post

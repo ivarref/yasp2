@@ -32,6 +32,7 @@
 (defn make-connection! [proxy-to-port]
   (let [s (^[String int] Socket/new "127.0.0.1" proxy-to-port)]
     (.setSoTimeout s 10)
+    (.setKeepAlive s true)
     {:socket s
      :in     (BufferedInputStream. (.getInputStream s))
      :out    (BufferedOutputStream. (.getOutputStream s))}))
@@ -116,11 +117,14 @@
                            (with-open [input-stream (.getRequestBody ex)
                                        baos (ByteArrayOutputStream.)]
                              (io/copy input-stream baos)
-                             (let [body-str (^[byte/1 Charset] String/new (.toByteArray baos) StandardCharsets/US_ASCII)
+                             (let [body-str (^[byte/1 Charset] String/new
+                                              (.toByteArray baos)
+                                              StandardCharsets/US_ASCII)
                                    decoded (http/decode-body-string body-str)
                                    resp (handle-body state-atom proxy-to-port decoded)]
                                resp))
                            (catch Exception e
+                             (.printStackTrace e)
                              (http/encode {:error (str "Exception: " (ex-message e))})))]
     (respond! ex 200 encoded-response)))
 
@@ -139,13 +143,16 @@
       (^void handle [_ ^HttpExchange ex]
         (locking state-atom
           (swap! state-atom (fn [old-state]
-                              (update old-state :running-threads (fnil conj #{}) (Thread/currentThread)))))
+                              (update old-state :running-threads
+                                      (fnil conj #{})
+                                      (Thread/currentThread)))))
         (try
           (post-handler state-atom proxy-to-port ex)
           (finally
             (locking state-atom
               (swap! state-atom (fn [old-state]
-                                  (update old-state :running-threads (fnil disj #{})
+                                  (update old-state :running-threads
+                                          (fnil disj #{})
                                           (Thread/currentThread)))))))))
     fallback-handler))
 
@@ -157,20 +164,14 @@
     (with-meta
       (reify AutoCloseable
         (close [_]
-          (println "web-server: Begin shutdown")
+          #_(println "web-server: Begin shutdown")
           (doseq [{:keys [socket in out]} (vals (get @state-atom :session))]
-            (println "Force closing connection ...")
+            #_(println "Force closing connection ...")
             (tls/close-silently in)
             (tls/close-silently out)
             (tls/close-silently socket))
           (let [stop-server-job (future (.stop server 3))]
             (when (= :timeout (deref stop-server-job 5000 :timeout))
               (binding [*out* *err*]
-                (println "Warning: Timeout waiting for web server to stop"))))
-          #_(let [web-server-shutdown (future
-                                        (while (not (empty? (keys (get @state-atom :session))))
-                                          (Thread/sleep 10)))]
-              (when (= :timeout (deref web-server-shutdown 5000 :timeout))
-                (binding [*out* *err*]
-                  (println "Warning: Timeout waiting for web sessions to exit"))))))
+                (println "Warning: Timeout waiting for web server to stop"))))))
       {:port (.getPort (.getAddress server))})))

@@ -1,14 +1,13 @@
 (ns yasp2.mtls-web-proxy-client
   (:require [nrepl.http :as http]
-            [nrepl.tls :as tls]
-            [yasp2.web-server :as web-server])
-  (:import (java.io BufferedInputStream BufferedOutputStream BufferedReader InputStream InputStreamReader IOException OutputStream)
+            [nrepl.tls :as tls])
+  (:import (java.io BufferedInputStream BufferedOutputStream IOException)
            (java.lang AutoCloseable)
            (java.net InetSocketAddress ServerSocket Socket SocketTimeoutException)
            (java.nio ByteBuffer)
-           (java.nio.charset StandardCharsets)
            (java.util Arrays)
-           (javax.net.ssl SSLContext SSLEngine SSLEngineResult SSLEngineResult$HandshakeStatus SSLEngineResult$Status SSLServerSocket)))
+           (javax.net.ssl SSLContext SSLEngine SSLEngineResult SSLEngineResult$HandshakeStatus
+                          SSLEngineResult$Status)))
 
 (set! *warn-on-reflection* true)
 
@@ -39,7 +38,8 @@
 
 
 (defn bytebuffer-drain-to-byte-array
-  "Copies the bytes written so far (0 .. position) to a byte array. Clears input byte buffer afterwards."
+  "Copies the bytes written so far (0 .. position) to a byte array.
+  Clears input byte buffer afterwards."
   [^ByteBuffer buf]
   (let [_ (.flip buf)
         arr (byte-array (.remaining buf))]
@@ -149,6 +149,7 @@
     (let [spent-ms (- (System/currentTimeMillis)
                       start-ms)]
       (if (> spent-ms 30000)
+        ;; this function should probably not throw exceptions
         (throw (ex-info "Spent too long handshaking" {}))
         (let [handshake-status (.getHandshakeStatus engine)]
           (if (or (= SSLEngineResult$HandshakeStatus/FINISHED handshake-status)
@@ -221,9 +222,7 @@
           (recur start-ms (byte-array 0)))))))
 
 
-(defn data-loop! [^String session-id
-                  opts
-                  ^SSLEngine engine
+(defn data-loop! [^String session-id opts ^SSLEngine engine
                   ^BufferedInputStream plain-in ^BufferedOutputStream plain-out
                   ^ByteBuffer app-in ^ByteBuffer app-out
                   ^ByteBuffer net-in ^ByteBuffer net-out
@@ -270,13 +269,15 @@
                   (recur byte-chunk))))))))))
 
 
-;; Based on https://docs.oracle.com/javase/8/docs/technotes/guides/security//jsse/samples/sslengine/SSLEngineSimpleDemo.java
+;; Based on
+;; https://docs.oracle.com/javase/8/docs/technotes/guides/security//jsse/samples/sslengine/SSLEngineSimpleDemo.java
 ;; The JDK docs:
 ;; https://docs.oracle.com/javase/8/docs/api/javax/net/ssl/SSLEngine.html
 ;; https://docs.oracle.com/javase/8/docs/api/javax/net/ssl/SSLEngineResult.HandshakeStatus.html
 ;; https://docs.oracle.com/javase/8/docs/api/java/nio/ByteBuffer.html
 ;; And plenty of help from Claude Code Opus 5.5 as well
-(defn run-conn-proxy! [opts ^SSLContext tls-context ^Socket plaintext]
+
+(defn handle-conn-proxy! [opts ^SSLContext tls-context ^Socket plaintext]
   (let [session-id (str (random-uuid))]
     (try
       (let [^SSLEngine engine (.createSSLEngine tls-context)
@@ -316,7 +317,8 @@
         (tls/close-silently plaintext)))))
 
 
-(defn adapted-opts [{:keys [client-keys-file web-server-endpoint
+(defn adapted-opts [{:keys [client-keys-file
+                            web-server-endpoint
                             drain-on-close?
                             result-promise
                             post-timeout-ms]}]
@@ -326,7 +328,7 @@
     :web-server-endpoint web-server-endpoint
     :drain-on-close? (or drain-on-close? false)
     :result-promise (or result-promise nil)
-    :post-timeout-ms (or post-timeout-ms 60000)))
+    :post-timeout-ms post-timeout-ms))
 
 
 (defn start-proxy-server! [opts]
@@ -336,13 +338,15 @@
         server (ServerSocket.)
         active-conns (atom 0)]
     (.bind server (InetSocketAddress. "127.0.0.1" 0))
+    ;; Start the server accept loop in the background
     (future
       (loop []
         (let [sock (.accept server)]
+          ;; Handle incoming connection in a separate thread
           (future
             (try
               (swap! active-conns inc)
-              (let [res (run-conn-proxy! opts' tls-context sock)]
+              (let [res (handle-conn-proxy! opts' tls-context sock)]
                 (when result-promise
                   (deliver result-promise res)))
               (catch Exception e
@@ -358,7 +362,7 @@
       (reify AutoCloseable
         (close [_]
           (try
-            (println "client-proxy: Begin shutdown")
+            #_(println "client-proxy: Begin shutdown")
             (tls/close-silently server)
             (when drain-on-close?
               (let [start-ms (System/currentTimeMillis)]
@@ -372,6 +376,7 @@
               (when (= :timeout (deref result-promise 10000 :timeout))
                 (throw (ex-info "Timeout waiting for result-promise" {}))))
             (finally
-              (println "client-proxy: Done shutdown")))))
+              nil
+              #_(println "client-proxy: Done shutdown")))))
       {:port (.getLocalPort server)})))
 
