@@ -2,8 +2,8 @@
 
  :aliases {:test      {:extra-paths ["test"]
                        :extra-deps  {io.github.ivarref/test-runner
-                                     {:git/sha "77db9dc8a279060d6a9e11ad7ed06e67b251f4c6"
-                                      :git/tag "0.1.97"}}
+                                     {:git/sha "f907727d8797c3ac6a4efd9ddec2d15c8320ede9"
+                                      :git/tag "0.1.99"}}
                        :main-opts   ["-m" "cognitect.test-runner"]
                        :exec-fn     cognitect.test-runner.api/test}
 

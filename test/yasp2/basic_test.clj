@@ -3,14 +3,41 @@
             [clojure.test :refer :all]
             [nrepl.tls :as tls]
             [yasp2.mtls-web-proxy-client :as client]
-            [yasp2.web-server :as web-server])
+            [yasp2.web-server :as web-server]
+            [yasp2.certgen :as certgen])
   (:import (java.io BufferedInputStream BufferedOutputStream BufferedReader
-                    BufferedWriter InputStream InputStreamReader OutputStream OutputStreamWriter)
+                    BufferedWriter File InputStream InputStreamReader OutputStream OutputStreamWriter)
            (java.lang AutoCloseable)
            (java.lang.management ManagementFactory)
            (java.net ServerSocket Socket SocketException)
            (java.nio.charset StandardCharsets)
            (javax.net.ssl SSLServerSocket)))
+
+
+(defn temp-file [file-name]
+  (let [f (File/createTempFile file-name ".keys")]
+    (.deleteOnExit f)
+    #_(spit (.getAbsolutePath f) content)
+    (.getAbsolutePath f)))
+
+
+(defonce client-keys-1 (temp-file "client-1"))
+(defonce server-keys-1 (temp-file "server-1"))
+
+(defonce client-keys-2 (temp-file "client-2"))
+(defonce server-keys-2 (temp-file "server-2"))
+
+
+(defonce
+  bootstrap-keys
+  (do
+    (let [{:keys [root-ca-cert server-key server-cert client-key client-cert]} (certgen/generate)]
+      (spit server-keys-1 (str root-ca-cert "\n" server-cert "\n" server-key))
+      (spit client-keys-1 (str root-ca-cert "\n" client-cert "\n" client-key)))
+    (let [{:keys [root-ca-cert server-key server-cert client-key client-cert]} (certgen/generate)]
+      (spit server-keys-2 (str root-ca-cert "\n" server-cert "\n" server-key))
+      (spit client-keys-2 (str root-ca-cert "\n" client-cert "\n" client-key)))
+    nil))
 
 
 (defn sock->line-writer [^Socket sock]
@@ -271,6 +298,49 @@
       (println "buffer-full->http-timeout error:" (ex-message e))
       (throw e))))
 
+
+(deftest bad-client-keys
+  (try
+    (let [result-promise (promise)
+          web-state (atom {})
+          exception-count (atom 0)
+          seen-server-conns (atom 0)]
+      (with-open [^AutoCloseable tls-server (start-tls-server!
+                                              server-keys-1
+                                              (fn [sock]
+                                                (swap! seen-server-conns inc)
+                                                (try
+                                                  (let [write (sock->line-writer sock)]
+                                                    (write "yolo"))
+                                                  (catch Exception _e
+                                                    (swap! exception-count inc)))))
+                  ^AutoCloseable web-server (web-server/start-web-server!
+                                              web-state (port-of tls-server))
+                  ^AutoCloseable plaintext-server (client/start-proxy-server!
+                                                    {:client-keys-file    client-keys-2
+                                                     :web-server-endpoint (str "http://127.0.0.1:"
+                                                                               (port-of web-server)
+                                                                               "/nrepl")
+                                                     :post-timeout-ms     3000
+                                                     :result-promise      result-promise
+                                                     :drain-on-close?     true})]
+        (try
+          (with-open [^Socket client (Socket. "127.0.0.1" ^int (port-of plaintext-server))]
+            (let [read-line (sock->line-reader client)
+                  write (sock->line-writer client)]
+              (write "hello")
+              (read-line)))
+          (catch Exception _e
+            ;; The proxy has closed the connection while we were using it.
+            ;; The cause: TLS handshake error
+            (swap! exception-count inc)
+            nil)))
+      (is (= 1 @seen-server-conns))
+      (is (= 2 @exception-count))
+      (is (= :handshake-error (:eof @result-promise))))
+    (catch Exception e
+      (println "bad-client-keys error:" (ex-message e))
+      (throw e))))
 
 ;; Trigger client-disconnected state by
 ;; 1. Filling the buffer to client-in in the proxy

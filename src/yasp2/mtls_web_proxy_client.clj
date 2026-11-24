@@ -7,7 +7,7 @@
            (java.nio ByteBuffer)
            (java.util Arrays)
            (javax.net.ssl SSLContext SSLEngine SSLEngineResult SSLEngineResult$HandshakeStatus
-                          SSLEngineResult$Status)))
+                          SSLEngineResult$Status SSLException SSLHandshakeException)))
 
 (set! *warn-on-reflection* true)
 
@@ -165,9 +165,10 @@
                                                        out-bytes)]
                 (when (:eof hdr-remote)
                   (throw (ex-info "Remote sent EOF during handshake" {})))
-                (handshake-feed-unwraps! engine net-in app-in byte-chunk)
-                (when (.isInboundDone engine)
-                  (throw (ex-info "Remote closed TLS during handshake" {})))
+                (try
+                  (handshake-feed-unwraps! engine net-in app-in byte-chunk)
+                  (catch Exception e
+                    (throw (ex-info "handshake-feed-unwraps! crashed" {:ex e}))))
                 (when (= 0 (alength ^byte/1 byte-chunk))
                   (Thread/sleep 10))
                 (recur start-ms)))))))))
@@ -289,24 +290,36 @@
             app-in (ByteBuffer/allocate buffer-max)
             app-out (ByteBuffer/allocate buffer-max)
             net-in (ByteBuffer/allocate buffer-max)
-            net-out (ByteBuffer/allocate buffer-max)]
-        ;; Do the TLS handshake first
-        (handshake! session-id buf-size engine opts net-in net-out app-in)
-        (.setSoTimeout plaintext 1000)
-        (let [plain-in (BufferedInputStream. (.getInputStream plaintext))
-              plain-out (BufferedOutputStream. (.getOutputStream plaintext))
-              buf (byte-array (int buf-size))]
-          (data-loop! session-id
-                      opts
-                      engine
-                      plain-in
-                      plain-out
-                      app-in
-                      app-out
-                      net-in
-                      net-out
-                      buf
-                      buf-size)))
+            net-out (ByteBuffer/allocate buffer-max)
+            ;; Do the TLS handshake first
+            [handshake-error-type ex] (try
+                                        (handshake! session-id buf-size engine opts net-in net-out app-in)
+                                        [nil nil]
+                                        (catch SSLHandshakeException e
+                                          [:handshake-error e])
+                                        (catch SSLException e
+                                          [:handshake-tls-exception e])
+                                        (catch IOException e
+                                          [:handshake-io-exception e]))]
+        (if (some? handshake-error-type)
+          {:eof handshake-error-type
+           :ex  ex}
+          (do
+            (.setSoTimeout plaintext 1000)
+            (let [plain-in (BufferedInputStream. (.getInputStream plaintext))
+                  plain-out (BufferedOutputStream. (.getOutputStream plaintext))
+                  buf (byte-array (int buf-size))]
+              (data-loop! session-id
+                          opts
+                          engine
+                          plain-in
+                          plain-out
+                          app-in
+                          app-out
+                          net-in
+                          net-out
+                          buf
+                          buf-size)))))
       (finally
         (try
           (http/post opts
