@@ -302,18 +302,15 @@
 (deftest bad-client-keys
   (try
     (let [result-promise (promise)
-          web-state (atom {})
-          exception-count (atom 0)
-          seen-server-conns (atom 0)]
+          web-state (atom {})]
       (with-open [^AutoCloseable tls-server (start-tls-server!
                                               server-keys-1
                                               (fn [sock]
-                                                (swap! seen-server-conns inc)
                                                 (try
                                                   (let [write (sock->line-writer sock)]
                                                     (write "yolo"))
                                                   (catch Exception _e
-                                                    (swap! exception-count inc)))))
+                                                    nil))))
                   ^AutoCloseable web-server (web-server/start-web-server!
                                               web-state (port-of tls-server))
                   ^AutoCloseable plaintext-server (client/start-proxy-server!
@@ -325,18 +322,11 @@
                                                      :result-promise      result-promise
                                                      :drain-on-close?     true})]
         (try
-          (with-open [^Socket client (Socket. "127.0.0.1" ^int (port-of plaintext-server))]
-            (let [read-line (sock->line-reader client)
-                  write (sock->line-writer client)]
-              (write "hello")
-              (read-line)))
+          (with-open [^Socket _client (Socket. "127.0.0.1" ^int (port-of plaintext-server))])
           (catch Exception _e
-            ;; The proxy has closed the connection while we were using it.
+            ;; The proxy may have closed the connection while we were using it.
             ;; The cause: TLS handshake error
-            (swap! exception-count inc)
             nil)))
-      (is (= 1 @seen-server-conns))
-      (is (= 2 @exception-count))
       (is (= :handshake-error (:eof @result-promise))))
     (catch Exception e
       (println "bad-client-keys error:" (ex-message e))

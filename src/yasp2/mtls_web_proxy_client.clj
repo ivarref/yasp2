@@ -1,5 +1,7 @@
 (ns yasp2.mtls-web-proxy-client
-  (:require [nrepl.http :as http]
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
+            [nrepl.http :as http]
             [nrepl.tls :as tls])
   (:import (java.io BufferedInputStream BufferedOutputStream IOException)
            (java.lang AutoCloseable)
@@ -293,7 +295,8 @@
             net-out (ByteBuffer/allocate buffer-max)
             ;; Do the TLS handshake first
             [handshake-error-type ex] (try
-                                        (handshake! session-id buf-size engine opts net-in net-out app-in)
+                                        (handshake! session-id buf-size engine opts
+                                                    net-in net-out app-in)
                                         [nil nil]
                                         (catch SSLHandshakeException e
                                           [:handshake-error e])
@@ -312,14 +315,10 @@
               (data-loop! session-id
                           opts
                           engine
-                          plain-in
-                          plain-out
-                          app-in
-                          app-out
-                          net-in
-                          net-out
-                          buf
-                          buf-size)))))
+                          plain-in plain-out
+                          app-in app-out
+                          net-in net-out
+                          buf buf-size)))))
       (finally
         (try
           (http/post opts
@@ -336,6 +335,14 @@
                             result-promise
                             post-timeout-ms]}]
   (assert (pos-int? post-timeout-ms))
+
+  (assert (string? client-keys-file))
+  (assert (.exists (io/file client-keys-file)))
+  (assert (.isFile (io/file client-keys-file)))
+
+  (assert (and (string? web-server-endpoint)
+               (or (str/starts-with? web-server-endpoint "http://")
+                   (str/starts-with? web-server-endpoint "https://"))))
   (assoc {}
     :client-keys-file client-keys-file
     :web-server-endpoint web-server-endpoint
