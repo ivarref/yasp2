@@ -2,7 +2,7 @@
 (require '[clojure.edn :as edn]
          '[babashka.process :refer [shell]])
 
-(def max-lines 70)
+(def max-lines 53)
 
 (let [{:keys [out]} (shell {:out :string :continue true}
                            "clj-kondo" "--lint" "src" "test"

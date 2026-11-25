@@ -3,13 +3,16 @@
             [clojure.string :as str]
             [nrepl.http :as http]
             [nrepl.tls :as tls])
-  (:import (java.io BufferedInputStream BufferedOutputStream IOException)
+  (:import (clojure.lang ExceptionInfo)
+           (java.io BufferedInputStream BufferedOutputStream IOException)
            (java.lang AutoCloseable)
            (java.net InetSocketAddress ServerSocket Socket SocketTimeoutException)
            (java.nio ByteBuffer)
+           (java.security.cert CertificateException)
            (java.util Arrays)
            (javax.net.ssl SSLContext SSLEngine SSLEngineResult SSLEngineResult$HandshakeStatus
-                          SSLEngineResult$Status SSLException SSLHandshakeException)))
+                          SSLEngineResult$Status SSLException SSLHandshakeException)
+           (sun.security.validator ValidatorException)))
 
 (set! *warn-on-reflection* true)
 
@@ -166,11 +169,12 @@
                                                        hdr
                                                        out-bytes)]
                 (when (:eof hdr-remote)
-                  (throw (ex-info "Remote sent EOF during handshake" {})))
+                  (throw (ex-info "Remote sent EOF during handshake" {:eof true})))
                 (try
                   (handshake-feed-unwraps! engine net-in app-in byte-chunk)
                   (catch Exception e
-                    (throw (ex-info "handshake-feed-unwraps! crashed" {:ex e}))))
+                    (throw (ex-info "handshake-feed-unwraps! crashed" {:eof true
+                                                                       :ex  e}))))
                 (when (= 0 (alength ^byte/1 byte-chunk))
                   (Thread/sleep 10))
                 (recur start-ms)))))))))
@@ -299,11 +303,17 @@
                                                     net-in net-out app-in)
                                         [nil nil]
                                         (catch SSLHandshakeException e
+                                          (loop [cause e]
+                                            (when cause
+                                              (println "cause:" (class cause))
+                                              (recur (.getCause cause))))
                                           [:handshake-error e])
                                         (catch SSLException e
                                           [:handshake-tls-exception e])
                                         (catch IOException e
-                                          [:handshake-io-exception e]))]
+                                          [:handshake-io-exception e])
+                                        (catch ExceptionInfo e
+                                          [:remote-eof e]))]
         (if (some? handshake-error-type)
           {:eof handshake-error-type
            :ex  ex}
@@ -369,9 +379,9 @@
               (let [res (handle-conn-proxy! opts' tls-context sock)]
                 (when result-promise
                   (deliver result-promise res)))
-              (catch Exception e
+              (catch Throwable e
                 (println ">>>> Local plaintext TCP->Web proxy crashed:" (ex-message e))
-                (.printStackTrace e)
+                (println e)
                 (when result-promise
                   (deliver result-promise {:error true
                                            :ex    e})))
@@ -393,8 +403,9 @@
                     (when (not= @active-conns 0)
                       (Thread/sleep 10)
                       (recur)))))
-              (when (= :timeout (deref result-promise 10000 :timeout))
-                (throw (ex-info "Timeout waiting for result-promise" {}))))
+              (when result-promise
+                (when (= :timeout (deref result-promise 10000 :timeout))
+                  (throw (ex-info "Timeout waiting for result-promise" {})))))
             (finally
               nil
               #_(println "client-proxy: Done shutdown")))))

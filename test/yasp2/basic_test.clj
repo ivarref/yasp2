@@ -332,6 +332,35 @@
       (println "bad-client-keys error:" (ex-message e))
       (throw e))))
 
+
+;; TODO the error message for this is not good enough ... We can do better!
+(deftest bad-key-type
+  (try
+    (let [result-promise (promise)
+          web-state (atom {})]
+      (with-open [^AutoCloseable tls-server (start-tls-server! client-keys-1 (fn [sock] nil))
+                  ^AutoCloseable web-server (web-server/start-web-server!
+                                              web-state (port-of tls-server))
+                  ^AutoCloseable plaintext-server (client/start-proxy-server!
+                                                    {:client-keys-file    server-keys-1
+                                                     :web-server-endpoint (str "http://127.0.0.1:"
+                                                                               (port-of web-server)
+                                                                               "/nrepl")
+                                                     :post-timeout-ms     3000
+                                                     :result-promise      result-promise
+                                                     :drain-on-close?     true})]
+        (try
+          (with-open [^Socket _client (Socket. "127.0.0.1" ^int (port-of plaintext-server))])
+          (catch Exception _e
+            ;; The proxy may have closed the connection while we were using it.
+            ;; The cause: TLS handshake error
+            nil)))
+      (is (= :handshake-error (:eof @result-promise))))
+    (catch Exception e
+      (println "bad-client-keys error:" (ex-message e))
+      (throw e))))
+
+
 ;; Trigger client-disconnected state by
 ;; 1. Filling the buffer to client-in in the proxy
 ;; 2. Wait for the proxy to block on write

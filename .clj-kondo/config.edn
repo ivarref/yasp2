@@ -1,4 +1,6 @@
 {:linters {:single-operand-comparison {:level :error}
            :shadowed-var              {:level :error}
+           :line-length               {:level           :error
+                                       :max-line-length 100}
            :discouraged-var           {:level                   :error
                                        clojure.core/read-string {:message "Use edn/read-string instead of read-string"}}}}
